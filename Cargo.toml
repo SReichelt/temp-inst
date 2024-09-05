@@ -1,0 +1,3 @@
+[workspace]
+members = ["temp-inst"]
+resolver = "2"
