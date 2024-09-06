@@ -494,8 +494,8 @@ pub mod wrappers {
 /// # Safety
 ///
 /// * The implementation of the trait must ensure that `shared_to_temp<'a>` followed by
-///   `temp_to_shared<'b>` cannot not cause undefined behavior when `'a: 'b`. (This essentially
-///   restricts `TempRepr` to covariant types.)
+///   `temp_to_shared<'b>` cannot cause undefined behavior when `'a: 'b`. (This essentially
+///   restricts `Shared<'a>` to types that are covariant in `'a`.)
 ///
 /// * If `Shared` implements `Send`, then it must be valid to send and access instances of `Temp`
 ///   across threads, and call `temp_to_shared` in a different thread than the original
@@ -543,10 +543,10 @@ pub unsafe trait TempRepr {
 /// * The type `Temp` must implement [`Clone`] and [`PartialEq`] in such a way that a call to
 ///   [`core::mem::swap`] with two `Temp` references is either detectable by cloning before and
 ///   comparing afterwards, or is harmless. Whenever a swapping operation is not detected by the
-///   [`PartialEq`] implementation, it is no longer guaranteed that a caller of `temp_to_shared` or
-///   `temp_to_mut` will uphold the conditions mentioned in the previous points, and the
-///   implementation must then avoid undefined behavior even when one or more conditions are
-///   violated.
+///   [`PartialEq`] implementation, the swapped instances of `Temp` must be interchangeable in terms
+///   of all other conditions. In particular, in all above points, undefined behavior must also be
+///   avoided if "`'a: 'b`" is weakened to "`'c: 'b` for some `'c` such that the result of
+///   `mut_to_temp<'c>` compared equal to the result of `mut_to_temp<'a>`".
 ///
 /// * If `Mutable` implements `Send`, then it must be valid to send and access instances of `Temp`
 ///   across threads, and call `temp_to_shared` or `temp_to_mut` in a different thread than the
