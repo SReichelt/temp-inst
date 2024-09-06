@@ -3,7 +3,6 @@
 use core::{
     cmp::Ordering,
     fmt::{self, Debug},
-    future::Future,
     hash::{Hash, Hasher},
     marker::{PhantomData, PhantomPinned},
     ops::{Deref, DerefMut, Range, RangeFrom, RangeFull, RangeTo},
@@ -93,7 +92,7 @@ impl<T: TempRepr> TempInst<T> {
     ///
     /// Afterwards, an instance of `T::Shared` can be recovered from the [`TempInst`] reference
     /// via [`Self::get`].
-    pub fn new_wrapper(obj: T::Shared<'_>) -> TempInstWrapper<T> {
+    pub fn new_wrapper(obj: T::Shared<'_>) -> TempInstWrapper<'_, T> {
         TempInstWrapper::new(obj)
     }
 
@@ -109,6 +108,7 @@ impl<T: TempRepr> TempInst<T> {
 
     /// Returns the object that was originally passed to [`Self::new`], [`Self::new_wrapper`], etc.,
     /// with a lifetime that is restricted to that of `self`.
+    #[must_use]
     pub fn get(&self) -> T::Shared<'_> {
         // SAFETY:
         //
@@ -182,7 +182,7 @@ impl<T: TempReprMut> TempInst<T> {
     /// This can be useful when combining mutable and shared references in a tuple. E.g.
     /// `T = (TempRefMut<U>, TempRef<V>)` represents `(&mut U, &V)`, and this is preserved by
     /// [`Self::new_wrapper_mut`], whereas [`Self::new_wrapper`] treats it as `(&U, &V)`.
-    pub unsafe fn new_wrapper_mut(obj: T::Mutable<'_>) -> TempInstWrapperMut<T>
+    pub unsafe fn new_wrapper_mut(obj: T::Mutable<'_>) -> TempInstWrapperMut<'_, T>
     where
         T: Clone + PartialEq,
     {
@@ -200,7 +200,7 @@ impl<T: TempReprMut> TempInst<T> {
     /// whether `T::Mutable` is a pinned reference. E.g. `T` can be [`TempRefMut`] or
     /// [`TempRefPin`], and then [`Self::get_mut_pinned`] will return a mutable or pinned mutable
     /// reference accordingly.
-    pub fn new_wrapper_pin(obj: T::Mutable<'_>) -> TempInstWrapperPin<T> {
+    pub fn new_wrapper_pin(obj: T::Mutable<'_>) -> TempInstWrapperPin<'_, T> {
         TempInstWrapperPin::new(obj)
     }
 
@@ -236,6 +236,7 @@ impl<T: TempReprMut> TempInst<T> {
 
     /// Returns the object that was originally passed to [`Self::new`], [`Self::new_wrapper_mut`],
     /// etc., with a lifetime that is restricted to that of `self`.
+    #[must_use]
     pub fn get_mut(&mut self) -> T::Mutable<'_> {
         // SAFETY:
         //
@@ -260,6 +261,7 @@ impl<T: TempReprMut> TempInst<T> {
 
     /// Like [`Self::get_mut`], but accepts a pinned reference as created by
     /// [`Self::new_wrapper_pin`].
+    #[must_use]
     pub fn get_mut_pinned(self: Pin<&mut Self>) -> T::Mutable<'_>
     where
         T: Unpin,
@@ -433,6 +435,7 @@ pub mod wrappers {
     impl<T: TempReprMut> TempInstWrapperPin<'_, T> {
         /// Returns a pinned mutable [`TempInst`] reference, which can be used with
         /// [`TempInst::get_mut_pinned`].
+        #[must_use]
         pub fn deref_pin(self: Pin<&mut Self>) -> Pin<&mut <Self as Deref>::Target> {
             unsafe { self.map_unchecked_mut(|p| &mut p.inst) }
         }
@@ -452,7 +455,7 @@ pub mod wrappers {
     #[cfg(not(feature = "std"))]
     fn modification_panic_fn() {
         // In the nostd case, we don't have `std::process::abort()`, so entering an endless loop
-        // seems like the best we can do.
+        // seems to be the best we can do.
         loop {}
     }
 
@@ -763,6 +766,7 @@ impl<T: ?Sized + ToOwned<Owned: Clone>> AlwaysShared for TempCow<T> {}
 
 macro_rules! impl_temp_repr_tuple {
     ($($idx:tt $T:ident),*) => {
+        #[allow(clippy::unused_unit)]
         unsafe impl<$($T: TempRepr),*> TempRepr for ($($T,)*) {
             type Shared<'a> = ($($T::Shared<'a>,)*) where Self: 'a;
 
@@ -776,6 +780,7 @@ macro_rules! impl_temp_repr_tuple {
             }
         }
 
+        #[allow(clippy::unused_unit)]
         unsafe impl<$($T: TempReprMut),*> TempReprMut for ($($T,)*) {
             type Mutable<'a> = ($($T::Mutable<'a>,)*) where Self: 'a;
 
@@ -1207,7 +1212,7 @@ mod tests {
 
     #[cfg(feature = "std")]
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "TempInst was modified")]
     fn temp_ref_call_mut_illegal_swap() {
         init_tests();
         let mut a = 42;
