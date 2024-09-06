@@ -107,19 +107,6 @@ impl<T: TempRepr> TempInst<T> {
         f(&inst)
     }
 
-    /// Calls `f` with a shared reference to a [`TempInst`] instance constructed from `obj`, and
-    /// returns the value returned by `f`.
-    ///
-    /// This method exists for consistency (with respect to [`Self::call_with_mut_async`]), but is
-    /// actually just a trivial application of [`Self::new_wrapper`].
-    pub async fn call_with_async<R, Fut: Future<Output = R>>(
-        obj: T::Shared<'_>,
-        f: impl FnOnce(&Self) -> Fut,
-    ) -> R {
-        let inst = Self::new_wrapper(obj);
-        f(&inst).await
-    }
-
     /// Returns the object that was originally passed to [`Self::new`], [`Self::new_wrapper`], etc.,
     /// with a lifetime that is restricted to that of `self`.
     pub fn get(&self) -> T::Shared<'_> {
@@ -156,8 +143,8 @@ impl<T: TempReprMut> TempInst<T> {
     ///
     /// As this method is unsafe, using one of the safe alternatives is strongly recommended:
     /// * [`Self::new_wrapper_pin`] if a pinned mutable [`TempInst`] reference is sufficient.
-    /// * [`Self::call_with_mut`] or [`Self::call_with_mut_async`] if the use of the mutable
-    ///   [`TempInst`] reference can be confined to a closure.
+    /// * [`Self::call_with_mut`] if the use of the mutable [`TempInst`] reference can be confined
+    ///   to a closure.
     ///
     /// [`Self::new_wrapper_mut`] potentially has a slight overhead compared to
     /// [`Self::new_wrapper_pin`], in terms of both time and space, though there is a good chance
@@ -237,29 +224,6 @@ impl<T: TempReprMut> TempInst<T> {
         f(&mut inst)
     }
 
-    /// Calls `f` with a mutable reference to a [`TempInst`] instance constructed from `obj`, and
-    /// returns the value returned by `f`.
-    ///
-    /// This method is a simple (but safe) wrapper around [`Self::new_wrapper_mut`], which
-    /// potentially has a slight overhead. If possible, use [`Self::new_wrapper_pin`] (or
-    /// [`Self::call_with_pin`]) instead.
-    ///
-    /// # Panics
-    ///
-    /// Calls [`std::process::abort`] if `f` modifies the internal state of the object that was
-    /// passed to it. See [`Self::new_wrapper_mut`] for more information.
-    pub async fn call_with_mut_async<R, Fut: Future<Output = R>>(
-        obj: T::Mutable<'_>,
-        f: impl FnOnce(&mut Self) -> Fut,
-    ) -> R
-    where
-        T: Clone + PartialEq,
-    {
-        // SAFETY: Trivial because the scope of `inst` ends at the end of this (async) function.
-        let mut inst = unsafe { Self::new_wrapper_mut(obj) };
-        f(&mut inst).await
-    }
-
     /// Calls `f` with a pinned mutable reference to a [`TempInst`] instance constructed from `obj`,
     /// and returns the value returned by `f`.
     ///
@@ -268,19 +232,6 @@ impl<T: TempReprMut> TempInst<T> {
     pub fn call_with_pin<R>(obj: T::Mutable<'_>, f: impl FnOnce(Pin<&mut Self>) -> R) -> R {
         let inst = pin!(Self::new_wrapper_pin(obj));
         f(inst.deref_pin())
-    }
-
-    /// Calls `f` with a pinned mutable reference to a [`TempInst`] instance constructed from `obj`,
-    /// and returns the value returned by `f`.
-    ///
-    /// This method exists for consistency (with respect to [`Self::call_with_mut_async`]), but is
-    /// actually just a trivial application of [`Self::new_wrapper_pin`].
-    pub async fn call_with_pin_async<R, Fut: Future<Output = R>>(
-        obj: T::Mutable<'_>,
-        f: impl FnOnce(Pin<&mut Self>) -> Fut,
-    ) -> R {
-        let inst = pin!(Self::new_wrapper_pin(obj));
-        f(inst.deref_pin()).await
     }
 
     /// Returns the object that was originally passed to [`Self::new`], [`Self::new_wrapper_mut`],
