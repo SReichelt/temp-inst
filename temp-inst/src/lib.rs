@@ -1,501 +1,402 @@
+//! This crate provides safe lifetime-erased representations for objects with lifetime parameters.
+//! Safety is achieved by making the lifetime-erased objects accessible only via short-lived
+//! references.
+//!
+//! The main use case is to convert multiple (shared or mutable) references into a single reference
+//! to a lifetime-erased object, which can then be passed to an API that only accepts a single
+//! reference.
+//!
+//! A lifetime-erased object can be obtained by creating one of [`TempInst`], [`TempInstMut`], or
+//! [`TempInstPin`], and dereferencing it. In the case of [`TempInstMut`], the
+//! [`TempInstMut::call_with`] method should be used because [`TempInstMut::new`] is unsafe.
+//!
+//! To see which types have a temporary representation, see the implementations of the [`TempRepr`]
+//! trait. It is possible to add temporary representations for custom types, preferably via
+//! [`mapped::HasTempRepr`].
+//!
+//! # Examples
+//!
+//! ```
+//! # use crate::temp_inst::*;
+//!
+//! // We want to implement this example trait for a specific type `Bar`, in order to call
+//! // `run_twice` below.
+//! pub trait Foo {
+//!     type Arg;
+//!
+//!     fn run(arg: &mut Self::Arg);
+//! }
+//!
+//! pub fn run_twice<F: Foo>(arg: &mut F::Arg) {
+//!     F::run(arg);
+//!     F::run(arg);
+//! }
+//!
+//! struct Bar;
+//!
+//! impl Foo for Bar {
+//!     // We actually want to use _two_ mutable references as the argument type. However, the
+//!     // associated type `Arg` does not have any lifetime parameter. If we can add a lifetime
+//!     // parameter `'a` to `Bar`, then `type Arg = (&'a mut i32, &'a mut i32)` will work. If we
+//!     // can't or don't want to do that, a pair of `TempRefMut` will do the trick.
+//!     type Arg = (TempRefMut<i32>, TempRefMut<i32>);
+//!
+//!     fn run(arg: &mut Self::Arg) {
+//!         // The mutable `TempRefMut` references can be dereferenced to obtain the mutable
+//!         // references that we passed to `call_with` below.
+//!         let (a_ref, b_ref) = arg;
+//!         **a_ref += **b_ref;
+//!         **b_ref += 1;
+//!     }
+//! }
+//!
+//! let mut a = 42;
+//! let mut b = 23;
+//!
+//! // Now we can convert the pair `(&mut a, &mut b)` to `&mut Foo::Arg`, and pass that to
+//! // `run_twice`.
+//! TempInstMut::call_with((&mut a, &mut b), run_twice::<Bar>);
+//!
+//! assert_eq!(a, 42 + 23 + 1 + 23);
+//! assert_eq!(b, 23 + 1 + 1);
+//! ```
+//!
+//! For shared or pinned mutable references, there is a slightly simpler API:
+//!
+//! ```
+//! # use crate::temp_inst::*;
+//!
+//! pub trait Foo {
+//!     type Arg;
+//!
+//!     fn run(arg: &Self::Arg) -> i32;
+//! }
+//!
+//! fn run_twice_and_add<F: Foo>(arg: &F::Arg) -> i32 {
+//!     F::run(arg) + F::run(arg)
+//! }
+//!
+//! struct Bar;
+//!
+//! impl Foo for Bar {
+//!     type Arg = (TempRef<i32>, TempRef<i32>);
+//!
+//!     fn run(arg: &Self::Arg) -> i32 {
+//!         let (a_ref, b_ref) = arg;
+//!         **a_ref * **b_ref
+//!     }
+//! }
+//!
+//! let inst = TempInst::new((&42, &23));
+//! let sum_of_products = run_twice_and_add::<Bar>(&inst);
+//!
+//! assert_eq!(sum_of_products, 42 * 23 + 42 * 23);
+//! ```
+
 #![cfg_attr(not(feature = "std"), no_std)]
 
 use core::{
     cmp::Ordering,
     fmt::{self, Debug},
     hash::{Hash, Hasher},
-    marker::{PhantomData, PhantomPinned},
+    marker::PhantomData,
     ops::{Deref, DerefMut, Range, RangeFrom, RangeFull, RangeTo},
     pin::{pin, Pin},
-    ptr::{self, NonNull},
+    ptr::NonNull,
     slice,
     str::Chars,
 };
 
-use {mapped::*, wrappers::*};
+use mapped::*;
 
-/// A safe lifetime-erased wrapper for an object with lifetime parameters. Intended for use with
-/// APIs that require a single (shared or mutable) reference to an object that cannot depend on
-/// lifetimes (except for the lifetime of that single reference).
+/// A wrapper around an instance of `T` which implements [`TempRepr`], i.e. is a temporary
+/// representation of a type `T::Shared<'a>`.
 ///
-/// For example, [`TempInst`] can be used to contract a tuple of references into a single reference
-/// and then later back into a tuple of references. For the full list of types that can be used
-/// with [`TempInst`], see the implementations of the [`TempRepr`] trait.
-///
-/// # Examples
-///
-/// ```
-/// # use crate::temp_inst::*;
-///
-/// // We want to implement this example trait for a specific type `Bar`, in order to call
-/// // `run_twice` below.
-/// pub trait Foo {
-///     type Arg;
-///
-///     fn run(arg: &mut Self::Arg);
-/// }
-///
-/// pub fn run_twice<F: Foo>(arg: &mut F::Arg) {
-///     F::run(arg);
-///     F::run(arg);
-/// }
-///
-/// struct Bar;
-///
-/// impl Foo for Bar {
-///     // We actually want to use _two_ mutable references as the argument type. However, the
-///     // associated type `Arg` does not have any lifetime parameter. If we can add a lifetime
-///     // parameter `'a` to `Bar`, then `type Arg = (&'a mut i32, &'a mut i32)` will work. If we
-///     // can't or don't want to do that, an equivalent `TempInst` will do the trick.
-///     type Arg = TempInst<(TempRefMut<i32>, TempRefMut<i32>)>;
-///
-///     fn run(arg: &mut Self::Arg) {
-///         // From a mutable `TempInst` reference, we can extract the mutable references that we
-///         // originally constructed it from.
-///         let (a_ref, b_ref) = arg.get_mut();
-///         *a_ref += *b_ref;
-///         *b_ref += 1;
-///     }
-/// }
-///
-/// let mut a = 42;
-/// let mut b = 23;
-///
-/// // Now we can convert the pair `(&mut a, &mut b)` to a mutable `TempInst` reference, and pass
-/// // that to `run_twice`.
-/// TempInst::call_with_mut((&mut a, &mut b), run_twice::<Bar>);
-///
-/// assert_eq!(a, 42 + 23 + 1 + 23);
-/// assert_eq!(b, 23 + 1 + 1);
-/// ```
-///
-/// For shared or pinned mutable references, there is a slightly simpler API:
-///
-/// ```
-/// # use crate::temp_inst::*;
-///
-/// pub trait Foo {
-///     type Arg;
-///
-///     fn run(arg: &Self::Arg) -> i32;
-/// }
-///
-/// fn run_twice_and_add<F: Foo>(arg: &F::Arg) -> i32 {
-///     F::run(arg) + F::run(arg)
-/// }
-///
-/// struct Bar;
-///
-/// impl Foo for Bar {
-///     type Arg = TempInst<(TempRef<i32>, TempRef<i32>)>;
-///
-///     fn run(arg: &Self::Arg) -> i32 {
-///         let (a_ref, b_ref) = arg.get();
-///         *a_ref * *b_ref
-///     }
-/// }
-///
-/// let inst = TempInst::new_wrapper((&42, &23));
-/// let sum_of_products = run_twice_and_add::<Bar>(&inst);
-///
-/// assert_eq!(sum_of_products, 42 * 23 + 42 * 23);
-/// ```
-pub struct TempInst<T: TempRepr>(T, PhantomPinned);
+/// [`TempInst`] itself has a lifetime parameter `'a` and borrows the object passed to
+/// [`TempInst::new`] for that lifetime; therefore it is logically equivalent to `T::Shared<'a>`.
+/// However, it can hand out references to the lifetime-less type `T` via its [`Deref`]
+/// implementation.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TempInst<'a, T: TempRepr + 'a>(T, PhantomData<T::Shared<'a>>);
 
-impl<T: TempRepr> TempInst<T> {
-    /// Converts an instance of `T::Shared` into a wrapper that implements
-    /// [`Deref<Target = TempInst>`]. Note that `T::Shared` is always the non-mutable variant of
-    /// `T`; e.g. even if `T` is [`TempRefMut<X>`], `T::Shared` is `&X`, not `&mut X`.
+impl<'a, T: TempRepr> TempInst<'a, T> {
+    /// Creates a [`TempInst`] from an instance of `T::Shared`. Note that `T::Shared` is always the
+    /// non-mutable variant of `T`; e.g. even if `T` is [`TempRefMut<X>`], `T::Shared` is `&X`, not
+    /// `&mut X`.
     ///
-    /// Afterwards, an instance of `T::Shared` can be recovered from the [`TempInst`] reference
-    /// via [`Self::get`].
+    /// A shared reference to `T` can be obtained from the result via [`Deref`].
     #[must_use]
-    pub fn new_wrapper(obj: T::Shared<'_>) -> TempInstWrapper<'_, T> {
-        TempInstWrapper::new(obj)
+    pub fn new(obj: T::Shared<'a>) -> Self {
+        // SAFETY: `obj` is borrowed for `'a`, which outlives the returned instance.
+        unsafe { TempInst(T::new_temp(obj), PhantomData) }
     }
 
-    /// Calls `f` with a shared reference to a [`TempInst`] instance constructed from `obj`, and
-    /// returns the value returned by `f`.
+    /// Calls `f` with a shared reference to `T` which is constructed from `obj`, and returns the
+    /// value returned by `f`.
     ///
-    /// This method exists for consistency (with respect to [`Self::call_with_mut`]), but is
-    /// actually just a trivial application of [`Self::new_wrapper`].
-    pub fn call_with<R>(obj: T::Shared<'_>, f: impl FnOnce(&Self) -> R) -> R {
-        let inst = Self::new_wrapper(obj);
+    /// This method exists for consistency (with respect to [`TempInstMut::call_with`]), but is
+    /// actually just a trivial application of [`Self::new`] and [`Deref::deref`].
+    pub fn call_with<R>(obj: T::Shared<'a>, f: impl FnOnce(&T) -> R) -> R {
+        let inst = Self::new(obj);
         f(&inst)
     }
+}
 
-    /// Returns the object that was originally passed to [`Self::new`], [`Self::new_wrapper`], etc.,
-    /// with a lifetime that is restricted to that of `self`.
-    #[must_use]
-    pub fn get(&self) -> T::Shared<'_> {
-        // SAFETY:
-        //
-        // Instances of `TempInst<T>` can only be created via `new` or `new_wrapper[...]`, and all
-        // do so via `T::shared_to_temp` or `T::mut_to_temp`.
-        //
-        // `new` requires a static lifetime. `new_wrapper[...]` accepts any lifetime, but the
-        // returned wrapper has the same lifetime, effectively borrowing all contained references
-        // until the wrapper is dropped. Dereferencing the wrapper borrows it, so we can be sure
-        // that the lifetime of the `TempInst` reference is outlived by the lifetime originally
-        // passed to `shared_to_temp` (or `mut_to_temp`).
-        unsafe { self.0.temp_to_shared() }
+impl<T: TempRepr> Deref for TempInst<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
-impl<T: TempReprMut> TempInst<T> {
-    /// Creates a new [`TempInst`] instance from an object with a static lifetime. This is the only
-    /// way to create an owned instance instead of a temporary wrapper.
-    ///
-    /// For safety reasons, [`Self::new`] receives an instance of `T::Mutable` rather than
-    /// `T::Shared`, but note that if `T` is e.g. [`TempRef`] rather than [`TempRefMut`],
-    /// `T::Mutable` is actually the same as `T::Shared`.
-    #[must_use]
-    pub fn new(obj: T::Mutable<'static>) -> Self {
-        TempInst(T::mut_to_temp(obj), PhantomPinned)
+impl<'a, T: TempRepr<Shared<'a>: Default>> Default for TempInst<'a, T> {
+    fn default() -> Self {
+        TempInst::new(Default::default())
     }
+}
 
-    /// Converts an instance of `T::Mutable` into a wrapper that can return a pinned mutable
-    /// [`TempInst`] reference. The client needs to pin the wrapper before using it, usually via
-    /// [`core::pin::pin!`].
+impl<T: TempRepr + Debug> Debug for TempInst<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A wrapper around an instance of `T` which implements [`TempReprMut`], i.e. is a temporary
+/// representation of a type `T::Mutable<'a>`.
+///
+/// [`TempInstPin`] itself has a lifetime parameter `'a` and borrows the object passed to
+/// [`TempInstPin::new`] for that lifetime; therefore it is logically equivalent to
+/// `T::Mutable<'a>`. However, it can hand out references to the lifetime-less type `T` via
+/// [`TempInstPin::deref_pin`]. The references have type `Pin<&mut T>`; use the slightly less
+/// efficient [`TempInstMut`] wrapper if `&mut T` is required instead.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TempInstPin<'a, T: TempReprMut + 'a>(T, PhantomData<T::Mutable<'a>>);
+
+impl<'a, T: TempReprMut> TempInstPin<'a, T> {
+    /// Creates a [`TempInstPin`] from an instance of `T::Mutable`.
     ///
-    /// Afterwards, an instance of `T::Mutable` can be recovered from the [`TempInst`] reference
-    /// via [`Self::get_mut_pinned`].
+    /// A pinned mutable reference to `T` can be obtained from the result via [`Self::deref_pin`].
+    /// As `deref_pin` expects `self` to be pinned, use the [`core::pin::pin!`] macro to pin the
+    /// result of [`Self::new`] on the stack.
     ///
-    /// Note that only the [`TempInst`] reference is pinned; this is completely independent of
-    /// whether `T::Mutable` is a pinned reference. E.g. `T` can be [`TempRefMut`] or
-    /// [`TempRefPin`], and then [`Self::get_mut_pinned`] will return a mutable or pinned mutable
+    /// Note that only the [`TempInstPin`] reference will be pinned; this is completely independent
+    /// of whether `T::Mutable` is a pinned reference. E.g. `T` can be [`TempRefMut`] or
+    /// [`TempRefPin`], and then `T::get_mut_pinned` will return a mutable or pinned mutable
     /// reference accordingly.
-    #[must_use]
-    pub fn new_wrapper_pin(obj: T::Mutable<'_>) -> TempInstWrapperPin<'_, T> {
-        TempInstWrapperPin::new(obj)
-    }
-
-    /// Calls `f` with a pinned mutable reference to a [`TempInst`] instance constructed from `obj`,
-    /// and returns the value returned by `f`.
-    ///
-    /// This method exists for consistency (with respect to [`Self::call_with_mut`]), but is
-    /// actually just a trivial application of [`Self::new_wrapper_pin`].
-    pub fn call_with_pin<R>(obj: T::Mutable<'_>, f: impl FnOnce(Pin<&mut Self>) -> R) -> R {
-        let inst = pin!(Self::new_wrapper_pin(obj));
-        f(inst.deref_pin())
-    }
-
-    /// Like [`Self::get_mut`], but accepts a pinned reference as created by
-    /// [`Self::new_wrapper_pin`].
-    #[must_use]
-    pub fn get_mut_pinned(self: Pin<&mut Self>) -> T::Mutable<'_>
-    where
-        T: Unpin,
-    {
-        // SAFETY: Like `get_mut`, but pinning prevents clients from swapping instances.
-        unsafe {
-            self.map_unchecked_mut(|inst| &mut inst.0)
-                .get_mut()
-                .temp_to_mut()
-        }
-    }
-}
-
-impl<T: TempReprMutCmp> TempInst<T> {
-    /// Converts an instance of `T::Mutable` into a wrapper that implements
-    /// [`DerefMut<Target = TempInst>`].
-    ///
-    /// Afterwards, an instance of `T::Mutable` can be recovered from the [`TempInst`] reference
-    /// via [`Self::get_mut`].
-    ///
-    /// As this method is unsafe, using one of the safe alternatives is strongly recommended:
-    /// * [`Self::new_wrapper_pin`] if a pinned mutable [`TempInst`] reference is sufficient.
-    /// * [`Self::call_with_mut`] if the use of the mutable [`TempInst`] reference can be confined
-    ///   to a closure.
-    ///
-    /// [`Self::new_wrapper_mut`] potentially has a slight overhead compared to
-    /// [`Self::new_wrapper_pin`], in terms of both time and space, though there is a good chance
-    /// that the compiler will optimize both away if it can see how the wrapper is used.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure at least one of the following two conditions.
-    /// * The [`Drop`] implementation of the returned wrapper is called whenever it goes out of
-    ///   scope. (In particular, the wrapper must not be passed to [`core::mem::forget`].)
-    /// * The state of the wrapper when it goes out of scope is the same as when it was created.
-    ///   (This condition can be violated by calling [`core::mem::swap`] or a related function on
-    ///   the [`TempInst`] reference. When the wrapper goes out of scope after passing the
-    ///   [`TempInst`] reference to [`core::mem::swap`], the _other_ [`TempInst`] instance that it
-    ///   was swapped with can become dangling. Note that passing the result of [`Self::get_mut`] to
-    ///   [`core::mem::swap`] is not unsafe.)
-    ///
-    /// # Panics
-    ///
-    /// The [`Drop`] implementation of the returned wrapper calls [`std::process::abort`] (after
-    /// calling the standard panic handler) if the [`TempInst`] instance has been modified, which is
-    /// not possible via its API but can be achieved by swapping it with another instance, e.g.
-    /// using [`core::mem::swap`].
-    ///
-    /// Unfortunately, a regular panic is not sufficient in this case because it can be caught
-    /// with [`std::panic::catch_unwind`], and a dangling [`TempInst`] reference can then be
-    /// obtained from the closure passed to [`std::panic::catch_unwind`] (safely, because
-    /// unfortunately [`std::panic::UnwindSafe`] is not an `unsafe` trait -- why?!!).
-    ///
-    /// The panic behavior can be changed via [`wrappers::set_modification_panic_fn`].
     ///
     /// # Remarks
     ///
     /// For many types, including [`TempRef`], `T::Mutable` is actually the same as `T::Shared`.
     /// This can be useful when combining mutable and shared references in a tuple. E.g.
     /// `T = (TempRefMut<U>, TempRef<V>)` represents `(&mut U, &V)`, and this is preserved by
-    /// [`Self::new_wrapper_mut`], whereas [`Self::new_wrapper`] treats it as `(&U, &V)`.
+    /// [`TempInstPin::new`], whereas [`TempInst::new`] treats it as `(&U, &V)`.
     #[must_use]
-    pub unsafe fn new_wrapper_mut(obj: T::Mutable<'_>) -> TempInstWrapperMut<'_, T> {
-        TempInstWrapperMut::new(obj)
+    pub fn new(obj: T::Mutable<'a>) -> Self {
+        // SAFETY: `obj` is borrowed for `'a`, which outlives the returned instance.
+        unsafe { TempInstPin(T::new_temp_mut(obj), PhantomData) }
     }
 
-    /// Calls `f` with a mutable reference to a [`TempInst`] instance constructed from `obj`, and
+    /// Dereferences a pinned mutable [`TempInstMut`] reference to obtain a pinned mutable reference
+    /// to `T`. From that reference, the original object can be obtained via
+    /// [`TempReprMut::get_mut_pinned`].
+    #[must_use]
+    pub fn deref_pin(self: Pin<&mut Self>) -> Pin<&mut T> {
+        unsafe { self.map_unchecked_mut(|inst| &mut inst.0) }
+    }
+
+    /// Calls `f` with a pinned mutable reference to `T` which is constructed from `obj`, and
     /// returns the value returned by `f`.
     ///
-    /// This method is a simple (but safe) wrapper around [`Self::new_wrapper_mut`], which
-    /// potentially has a slight overhead. If possible, use [`Self::new_wrapper_pin`] (or
-    /// [`Self::call_with_pin`]) instead.
+    /// This method exists for consistency (with respect to [`TempInstMut::call_with`]), but is
+    /// actually just a trivial application of [`Self::new`] and [`Self::deref_pin`].
+    pub fn call_with<R>(obj: T::Mutable<'a>, f: impl FnOnce(Pin<&mut T>) -> R) -> R {
+        let inst = pin!(Self::new(obj));
+        f(inst.deref_pin())
+    }
+}
+
+impl<T: TempReprMut> Deref for TempInstPin<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'a, T: TempReprMut<Mutable<'a>: Default>> Default for TempInstPin<'a, T> {
+    fn default() -> Self {
+        TempInstPin::new(Default::default())
+    }
+}
+
+impl<T: TempReprMut + Debug> Debug for TempInstPin<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A wrapper around an instance of `T` which implements [`TempReprMut`], i.e. is a temporary
+/// representation of a type `T::Mutable<'a>`.
+///
+/// [`TempInstMut`] itself has a lifetime parameter `'a` and borrows the object passed to
+/// [`TempInstMut::new`] for that lifetime; therefore it is logically equivalent to
+/// `T::Mutable<'a>`. However, it can hand out references to the lifetime-less type `T` via its
+/// [`DerefMut`] implementation.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TempInstMut<'a, T: TempReprMutChk + 'a>(T, T::SwapChkData, PhantomData<T::Mutable<'a>>);
+
+impl<'a, T: TempReprMutChk> TempInstMut<'a, T> {
+    /// Creates a [`TempInstMut`] from an instance of `T::Mutable`.
+    ///
+    /// A mutable reference to `T` can be obtained from the result via [`DerefMut`].
+    ///
+    /// As this method is unsafe, using one of the safe alternatives is strongly recommended:
+    /// * [`TempInstPin::new`] if a pinned mutable reference to `T` is sufficient.
+    /// * [`TempInstMut::call_with`] if the use of the mutable `T` reference can be confined to a
+    ///   closure.
+    ///
+    /// [`TempInstMut::new`] potentially has a slight overhead compared to [`TempInstPin::new`], in
+    /// terms of both time and space, though there is a good chance that the compiler will optimize
+    /// both away if it can analyze how the instance is used.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure at least one of the following two conditions.
+    /// * The [`Drop`] implementation of [`TempInstMut`] is called whenever the returned instance
+    ///   goes out of scope.
+    ///   (In particular, the instance must not be passed to [`core::mem::forget`].)
+    /// * The state of the instance when it goes out of scope is the same as when it was created.
+    ///   (This condition can be violated by calling [`core::mem::swap`] or a related function on
+    ///   the [`TempInstMut`] instance. When the instance goes out of scope after passing it to
+    ///   [`core::mem::swap`], the _other_ [`TempInstMut`] instance that it was swapped with can
+    ///   become dangling. Note that passing the result of [`Self::deref_mut`] to
+    ///   [`core::mem::swap`] is not unsafe, however.)
+    /// * `'a` is `'static`. (A [`TempInstMut`] instance with static lifetimes cannot become
+    ///   dangling.)
+    ///
+    /// # Panics
+    ///
+    /// The [`Drop`] implementation of the returned instance calls [`std::process::abort`] (after
+    /// calling the standard panic handler) if the instance has been modified, which is not possible
+    /// via its API but can be achieved by swapping it with another instance, e.g. using
+    /// [`core::mem::swap`].
+    ///
+    /// Unfortunately, a regular panic is insufficient in this case because it can be caught with
+    /// [`std::panic::catch_unwind`], and a dangling [`TempInstMut`] reference can then be obtained
+    /// from the closure passed to [`std::panic::catch_unwind`] (safely, because unfortunately
+    /// [`std::panic::UnwindSafe`] is not an `unsafe` trait -- why?!!).
+    ///
+    /// The panic behavior can be changed via [`set_modification_panic_fn`].
+    ///
+    /// # Remarks
+    ///
+    /// For many types, including [`TempRef`], `T::Mutable` is actually the same as `T::Shared`.
+    /// This can be useful when combining mutable and shared references in a tuple. E.g.
+    /// `T = (TempRefMut<U>, TempRef<V>)` represents `(&mut U, &V)`, and this is preserved by
+    /// [`TempInstMut::new`], whereas [`TempInst::new`] treats it as `(&U, &V)`.
+    #[must_use]
+    pub unsafe fn new(obj: T::Mutable<'a>) -> Self {
+        // SAFETY: `obj` is borrowed for `'a`, which outlives the returned instance.
+        let temp = T::new_temp_mut(obj);
+        let chk_data = temp.swap_chk_data();
+        TempInstMut(temp, chk_data, PhantomData)
+    }
+
+    /// Calls `f` with a mutable reference to `T` constructed from `obj`, and returns the value
+    /// returned by `f`.
+    ///
+    /// This method is a simple (but safe) wrapper around [`Self::new`], which potentially has a
+    /// slight overhead. If possible, use [`TempInstPin::new`] (or [`TempInstPin::call_with`])
+    /// instead.
     ///
     /// # Panics
     ///
     /// Calls [`std::process::abort`] if `f` modifies the internal state of the object that was
-    /// passed to it. See [`Self::new_wrapper_mut`] for more information.
-    pub fn call_with_mut<R>(obj: T::Mutable<'_>, f: impl FnOnce(&mut Self) -> R) -> R {
+    /// passed to it. See [`Self::new`] for more information.
+    pub fn call_with<R>(obj: T::Mutable<'a>, f: impl FnOnce(&mut T) -> R) -> R {
         // SAFETY: Trivial because the scope of `inst` ends at the end of this function.
-        let mut inst = unsafe { Self::new_wrapper_mut(obj) };
+        let mut inst = unsafe { Self::new(obj) };
         f(&mut inst)
     }
+}
 
-    /// Returns the object that was originally passed to [`Self::new`], [`Self::new_wrapper_mut`],
-    /// etc., with a lifetime that is restricted to that of `self`.
-    #[must_use]
-    pub fn get_mut(&mut self) -> T::Mutable<'_> {
-        // SAFETY:
-        //
-        // Mutable instances of `TempInst<T>` can only be created via `new`, `new_wrapper_mut`, or
-        // `new_wrapper_pin`, and all do so via `T::mut_to_temp`.
-        //
-        // `new` requires a static lifetime. `new_wrapper[...]` accepts any lifetime, but the
-        // returned wrapper has the same lifetime, effectively borrowing all contained references
-        // until the wrapper is dropped. Dereferencing the wrapper borrows it, so we can be sure
-        // that the lifetime of the `TempInst` reference is outlived by the lifetime originally
-        // passed to `mut_to_temp`, and that no other borrow can exist.
-        //
-        // A caveat is that mutable `TempInst` references can be passed to `core::mem::swap` and
-        // related functions, counteracting the rules specified in `TempReprMut`. The swapping
-        // operation itself is not problematic because it merely switches the role of the two
-        // references with respect to all safety rules. However, the rules are violated when one of
-        // the original borrows goes out of scope. By requiring that the `Drop` implementation of
-        // the corresponding wrapper is executed, we make sure that the swap is detected at that
-        // point.
-        unsafe { self.0.temp_to_mut() }
+impl<T: TempReprMutChk> Deref for TempInstMut<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
-impl<T: TempReprMut + 'static> Default for TempInst<T>
-where
-    T::Mutable<'static>: Default,
-{
+impl<T: TempReprMutChk> DerefMut for TempInstMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T: TempReprMutChk<Mutable<'static>: Default>> Default for TempInstMut<'static, T> {
     fn default() -> Self {
-        TempInst::new(T::Mutable::default())
+        // SAFETY: Creating a `TempInstMut` instance with a `'static` lifetime is explicitly
+        // declared as safe.
+        unsafe { TempInstMut::new(Default::default()) }
     }
 }
 
-impl<T: TempRepr> PartialEq for TempInst<T>
-where
-    for<'a> T::Shared<'a>: PartialEq,
-{
-    fn eq(&self, other: &Self) -> bool {
-        self.get() == other.get()
-    }
-}
-
-impl<T: TempRepr> Eq for TempInst<T> where for<'a> T::Shared<'a>: Eq {}
-
-impl<T: TempRepr> PartialOrd for TempInst<T>
-where
-    for<'a> T::Shared<'a>: PartialOrd,
-{
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.get().partial_cmp(&other.get())
-    }
-}
-
-impl<T: TempRepr> Ord for TempInst<T>
-where
-    for<'a> T::Shared<'a>: Ord,
-{
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.get().cmp(&other.get())
-    }
-}
-
-impl<T: TempRepr> Hash for TempInst<T>
-where
-    for<'a> T::Shared<'a>: Hash,
-{
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.get().hash(state);
-    }
-}
-
-impl<T: TempRepr> Debug for TempInst<T>
-where
-    for<'a> T::Shared<'a>: Debug,
-{
+impl<T: TempReprMutChk + Debug> Debug for TempInstMut<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.get().fmt(f)
+        self.0.fmt(f)
+    }
+}
+impl<T: TempReprMutChk> Drop for TempInstMut<'_, T> {
+    fn drop(&mut self) {
+        if self.0.swap_chk_data() != self.1 {
+            modification_panic();
+        }
     }
 }
 
-pub mod wrappers {
-    use super::*;
+#[cfg(feature = "std")]
+fn modification_panic_fn() {
+    // Note: Can be replaced by `std::panic::always_abort` once that is stabilized.
+    let orig_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        orig_hook(panic_info);
+        std::process::abort()
+    }));
+    panic!("TempInstMut instance was modified; this is not allowed because it violates safety guarantees");
+}
 
-    /// A lifetime-dependent wrapper that contains a [`TempInst`] and hands out shared references to
-    /// it via [`Deref`].
-    pub struct TempInstWrapper<'a, T: TempRepr + 'a> {
-        inst: TempInst<T>,
-        phantom: PhantomData<T::Shared<'a>>,
-    }
+#[cfg(not(feature = "std"))]
+fn modification_panic_fn() {
+    // In the nostd case, we don't have `std::process::abort()`, so entering an endless loop
+    // seems to be the best we can do.
+    loop {}
+}
 
-    impl<'a, T: TempRepr> TempInstWrapper<'a, T> {
-        #[must_use]
-        pub(crate) fn new(obj: T::Shared<'a>) -> Self {
-            TempInstWrapper {
-                inst: TempInst(T::shared_to_temp(obj), PhantomPinned),
-                phantom: PhantomData,
-            }
-        }
-    }
+static mut MODIFICATION_PANIC_FN: fn() = modification_panic_fn;
 
-    impl<T: TempRepr> Deref for TempInstWrapper<'_, T> {
-        type Target = TempInst<T>;
+/// Sets an alternative function to be called by the [`Drop`] implementation of [`TempInstMut`]
+/// when it encounters an illegal modification.
+///
+/// # Safety
+///
+/// * Changing the panic function is only allowed when no other thread is able to interact with
+///   this crate.
+///
+/// * The panic function must not return unless [`std::thread::panicking`] returns `true`.
+///
+/// * If the panic function causes an unwinding panic, the caller of
+///   [`set_modification_panic_fn`] assumes the responsibility that no instance or reference of
+///   [`TempInstMut`] is used across (i.e. captured in) [`std::panic::catch_unwind`].
+pub unsafe fn set_modification_panic_fn(panic_fn: fn()) {
+    MODIFICATION_PANIC_FN = panic_fn;
+}
 
-        fn deref(&self) -> &Self::Target {
-            &self.inst
-        }
-    }
-
-    /// A lifetime-dependent wrapper that contains a [`TempInst`] and hands out pinned mutable
-    /// references to it.
-    pub struct TempInstWrapperPin<'a, T: TempReprMut + 'a> {
-        inst: TempInst<T>,
-        phantom: PhantomData<T::Mutable<'a>>,
-    }
-
-    impl<'a, T: TempReprMut> TempInstWrapperPin<'a, T> {
-        #[must_use]
-        pub(crate) fn new(obj: T::Mutable<'a>) -> Self {
-            TempInstWrapperPin {
-                inst: TempInst(T::mut_to_temp(obj), PhantomPinned),
-                phantom: PhantomData,
-            }
-        }
-    }
-
-    impl<T: TempReprMut> Deref for TempInstWrapperPin<'_, T> {
-        type Target = TempInst<T>;
-
-        fn deref(&self) -> &Self::Target {
-            &self.inst
-        }
-    }
-
-    impl<T: TempReprMut> TempInstWrapperPin<'_, T> {
-        /// Returns a pinned mutable [`TempInst`] reference, which can be used with
-        /// [`TempInst::get_mut_pinned`].
-        #[must_use]
-        pub fn deref_pin(self: Pin<&mut Self>) -> Pin<&mut <Self as Deref>::Target> {
-            unsafe { self.map_unchecked_mut(|p| &mut p.inst) }
-        }
-    }
-
-    /// A lifetime-dependent wrapper that contains a [`TempInst`] and hands out mutable references
-    /// to it via [`DerefMut`].
-    pub struct TempInstWrapperMut<'a, T: TempReprMutCmp + 'a> {
-        inst: TempInst<T>,
-        orig: T,
-        phantom: PhantomData<T::Mutable<'a>>,
-    }
-
-    impl<'a, T: TempReprMutCmp> TempInstWrapperMut<'a, T> {
-        // Safety: see `TempInst::new_wrapper_mut`.
-        #[must_use]
-        pub(crate) unsafe fn new(obj: T::Mutable<'a>) -> Self {
-            let orig = T::mut_to_temp(obj);
-            let inst = TempInst(orig.clone(), PhantomPinned);
-            TempInstWrapperMut {
-                inst,
-                orig,
-                phantom: PhantomData,
-            }
-        }
-    }
-
-    impl<T: TempReprMutCmp> Drop for TempInstWrapperMut<'_, T> {
-        fn drop(&mut self) {
-            if self.inst.0 != self.orig {
-                modification_panic();
-            }
-        }
-    }
-
-    impl<T: TempReprMutCmp> Deref for TempInstWrapperMut<'_, T> {
-        type Target = TempInst<T>;
-
-        fn deref(&self) -> &Self::Target {
-            &self.inst
-        }
-    }
-
-    impl<T: TempReprMutCmp> DerefMut for TempInstWrapperMut<'_, T> {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.inst
-        }
-    }
-
-    #[cfg(feature = "std")]
-    fn modification_panic_fn() {
-        // Note: Can be replaced by `std::panic::always_abort` once that is stabilized.
-        let orig_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |panic_info| {
-            orig_hook(panic_info);
-            std::process::abort()
-        }));
-        panic!("TempInst instance was modified; this is not allowed because it violates safety guarantees");
-    }
-
-    #[cfg(not(feature = "std"))]
-    fn modification_panic_fn() {
-        // In the nostd case, we don't have `std::process::abort()`, so entering an endless loop
-        // seems to be the best we can do.
-        loop {}
-    }
-
-    static mut MODIFICATION_PANIC_FN: fn() = modification_panic_fn;
-
-    /// Sets an alternative function to be called by the wrapper returned by
-    /// [`TempInst::new_wrapper_mut`] when it encounters an illegal modification.
-    ///
-    /// # Safety
-    ///
-    /// * Changing the panic function is only allowed when no other thread is able to interact with
-    ///   this crate.
-    ///
-    /// * The panic function must not return unless [`std::thread::panicking`] returns `true`.
-    ///
-    /// * If the panic function causes an unwinding panic, the caller of
-    ///   [`set_modification_panic_fn`] assumes the responsibility that no mutable [`TempInst`]
-    ///   reference is used across (i.e. captured in) [`std::panic::catch_unwind`].
-    pub unsafe fn set_modification_panic_fn(panic_fn: fn()) {
-        MODIFICATION_PANIC_FN = panic_fn;
-    }
-
-    fn modification_panic() {
-        // SAFETY: The safety conditions of `set_modification_panic_fn` guarantee that no other
-        // thread is concurrently modifying the static variable.
-        unsafe { MODIFICATION_PANIC_FN() }
-    }
+fn modification_panic() {
+    // SAFETY: The safety conditions of `set_modification_panic_fn` guarantee that no other
+    // thread is concurrently modifying the static variable.
+    unsafe { MODIFICATION_PANIC_FN() }
 }
 
 /// A trait that specifies that a type is a "temporary representation" of another type, where that
@@ -512,11 +413,11 @@ pub mod wrappers {
 ///
 /// # Safety
 ///
-/// * The implementation of the trait must ensure that `shared_to_temp<'a>` followed by
-///   `temp_to_shared<'b>` cannot cause undefined behavior when `'a: 'b`. (This essentially
-///   restricts `Shared<'a>` to types that are covariant in `'a`.)
+/// * The implementation of the trait must ensure that `new_temp<'a>` followed by `get<'b>` cannot
+///   cause undefined behavior when `'a: 'b`. (This essentially restricts `Shared<'a>` to types that
+///   are covariant in `'a`.)
 ///
-/// * The above must also hold if a (legal) cast was applied to the result of `shared_to_temp`.
+/// * The above must also hold if a (legal) cast was applied to the result of `new_temp`.
 pub unsafe trait TempRepr {
     /// The type that `Self` is a temporary representation of. May contain shared references of
     /// lifetime `'a`.
@@ -525,19 +426,19 @@ pub unsafe trait TempRepr {
         Self: 'a;
 
     /// Converts the given object to its temporary representation.
-    fn shared_to_temp(obj: Self::Shared<'_>) -> Self;
-
-    /// Converts from a shared temporary reference back to the original type with a
-    /// suitably-restricted lifetime.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that the lifetime that was used in the call to `shared_to_temp` (or
-    /// `mut_to_temp`) outlives the lifetime passed to `temp_to_shared`, and that `temp_to_mut` is
-    /// not called with an overlapping lifetime if [`TempReprMut`] is also implemented.
+    /// The caller must ensure that the returned object does not outlive the lifetime argument of
+    /// `obj`, and that [`TempReprMut::get_mut`] or [`TempReprMut::get_mut_pinned`] is never called
+    /// on the result.
     ///
-    /// (Exception: see the caveat about [`PartialEq`] in the safety rules of [`TempReprMutCmp`].)
-    unsafe fn temp_to_shared(&self) -> Self::Shared<'_>;
+    /// (Exception: see the caveat in the safety rules of [`TempReprMutChk`].)
+    unsafe fn new_temp(obj: Self::Shared<'_>) -> Self;
+
+    /// Converts from a shared temporary reference back to the original type with a
+    /// suitably-restricted lifetime.
+    fn get(&self) -> Self::Shared<'_>;
 }
 
 /// An extension of [`TempRepr`] that adds support for mutable references.
@@ -550,14 +451,17 @@ pub unsafe trait TempRepr {
 /// In addition to the requirements of [`TempRepr`], the implementation needs to ensure the
 /// following properties.
 ///
-/// * `mut_to_temp<'a>` followed by `temp_to_mut<'b>` must not cause undefined behavior when
-///   `'a: 'b` and `'b` does not overlap with any other lifetime passed to `temp_to_shared` or
-///   `temp_to_mut`.
+/// * `new_temp_mut<'a>` followed by `get_mut<'b>` or `get_mut_pinned<'b>` must not cause undefined
+///   behavior when `'a: 'b` and `'b` does not overlap with any other lifetime passed to `get` or
+///   `get_mut` or `get_mut_pinned`.
 ///
-/// * `mut_to_temp<'a>` followed by `temp_to_shared<'b>` must not cause undefined behavior when
-///   `'a: 'b` and `'b` does not overlap with any lifetime passed to `temp_to_mut`.
+/// * `new_temp_mut<'a>` followed by `get<'b>` must not cause undefined behavior when `'a: 'b` and
+///   `'b` does not overlap with any lifetime passed to `get_mut` or `get_mut_pinned`.
 ///
-/// * The above must also hold if a (legal) cast was applied to the result of `mut_to_temp`.
+/// * `get_mut_pinned` must either have a custom implementation, or the default implementation via
+///   `get_mut` must be safe.
+///
+/// * The above must also hold if a (legal) cast was applied to the result of `new_temp_mut`.
 pub unsafe trait TempReprMut: TempRepr {
     /// The type that `Self` is a temporary representation of. May contain mutable references of
     /// lifetime `'a`.
@@ -566,50 +470,69 @@ pub unsafe trait TempReprMut: TempRepr {
         Self: 'a;
 
     /// Converts the given object to a temporary representation without a lifetime parameter.
-    fn mut_to_temp(obj: Self::Mutable<'_>) -> Self;
-
-    /// Converts from a mutable reference to the temporary representation back to the original type,
-    /// with a restricted lifetime.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that the temporary representation was created using `mut_to_temp`
-    /// (not `shared_to_temp`), that the lifetime that was used in the call to `mut_to_temp`
-    /// outlives the lifetime passed to `temp_to_mut`, and that neither `temp_to_shared` nor
-    /// `temp_to_mut` are called with an overlapping lifetime.
+    /// The caller must ensure that the returned object does not outlive the lifetime argument of
+    /// `obj`.
     ///
-    /// (Exception: see the caveat about [`PartialEq`] in the safety rules of [`TempReprMutCmp`].)
-    unsafe fn temp_to_mut(&mut self) -> Self::Mutable<'_>;
+    /// (Exception: see the caveat in the safety rules of [`TempReprMutChk`].)
+    unsafe fn new_temp_mut(obj: Self::Mutable<'_>) -> Self;
+
+    /// Converts from a mutable reference to the temporary representation back to the original type,
+    /// with a restricted lifetime.
+    fn get_mut(&mut self) -> Self::Mutable<'_>;
+
+    /// Like [`TempReprMut::get_mut`], but takes a pinned mutable reference to `Self`.
+    fn get_mut_pinned(self: Pin<&mut Self>) -> Self::Mutable<'_> {
+        // SAFETY: See corresponding trait rule.
+        unsafe { self.get_unchecked_mut().get_mut() }
+    }
 }
 
-/// An extension of [`TempReprMut`] that allows mutable references to be passed to safe client code.
+/// An extension of [`TempReprMut`] that allows non-pinned mutable references to be passed to safe
+/// client code.
 ///
 /// # Safety
 ///
-/// [`Clone`] and [`PartialEq`] must be implemented in such a way that a call to [`core::mem::swap`]
-/// is either detectable by cloning before and comparing afterwards, or is harmless. Whenever a
-/// swapping operation is not detected by the [`PartialEq`] implementation, the swapped instances
-/// must be interchangeable in terms of all safety conditions of [`TempRepr`] and [`TempReprMut`].
+/// [`TempReprMutChk::swap_chk_data`] must be implemented in such a way that a call to
+/// [`core::mem::swap`] is either detectable by calling `swap_chk_data` before and after and
+/// comparing the result via the [`PartialEq`] implementation, or is harmless, in the following
+/// sense:
+///
+/// Whenever a swapping operation is not detected by comparing the result of `swap_chk_data`,
+/// the swapped instances must be interchangeable in terms of all safety conditions of [`TempRepr`]
+/// and [`TempReprMut`].
 /// In particular, in all specific points, undefined behavior must also be avoided when the
-/// condition "`'a: 'b`" is weakened to "`'c: 'b` for some `'c` such that the result of
-/// `shared_to_temp<'c>`/`mut_to_temp<'c>` compared equal to the result of
-/// `shared_to_temp<'a>`/`mut_to_temp<'a>`".
-pub unsafe trait TempReprMutCmp: TempReprMut + Clone + PartialEq {}
+/// condition "`'a: 'b`" is weakened to "`'c: 'b` for some `'c` where the result of
+/// `swap_chk_data` was equal.
+pub unsafe trait TempReprMutChk: TempReprMut {
+    type SwapChkData: PartialEq;
+
+    /// Obtains an object (usually a copy of the internal state of `self`) that can be used to check
+    /// whether `self` was swapped with another instance of `Self` in such a way that the safety
+    /// rules of [`TempReprMutChk`] are violated.
+    fn swap_chk_data(&self) -> Self::SwapChkData;
+}
 
 /// A marker trait that causes [`TempReprMut`] to be implemented identically to [`TempRepr`].
 pub trait AlwaysShared: TempRepr {}
 
 // SAFETY: The additional conditions of `TempReprMut` are trivially satisfied if the references
-// returned by `temp_to_mut` are actually shared references.
+// returned by `get_mut`/`get_mut_pinned` are actually shared references.
 unsafe impl<T: AlwaysShared> TempReprMut for T {
     type Mutable<'a> = Self::Shared<'a> where Self: 'a;
 
-    fn mut_to_temp(obj: Self::Mutable<'_>) -> Self {
-        Self::shared_to_temp(obj)
+    unsafe fn new_temp_mut(obj: Self::Mutable<'_>) -> Self {
+        Self::new_temp(obj)
     }
 
-    unsafe fn temp_to_mut(&mut self) -> Self::Mutable<'_> {
-        self.temp_to_shared()
+    fn get_mut(&mut self) -> Self::Mutable<'_> {
+        self.get()
+    }
+
+    fn get_mut_pinned(self: Pin<&mut Self>) -> Self::Mutable<'_> {
+        self.into_ref().get_ref().get()
     }
 }
 
@@ -619,27 +542,31 @@ unsafe impl<T: AlwaysShared> TempReprMut for T {
 
 /// A wrapper type that trivially implements [`TempRepr`]/[`TempReprMut`] for any `T: Clone` in such
 /// a way that no lifetimes are erased.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct SelfRepr<T: Clone>(T);
 
-// SAFETY: All conditions are trivially satisfied because the `temp_to_shared` implementation isn't
+// SAFETY: All conditions are trivially satisfied because the `get` implementation isn't
 // actually unsafe.
 unsafe impl<T: Clone> TempRepr for SelfRepr<T> {
     type Shared<'a> = T where Self: 'a;
 
-    fn shared_to_temp(obj: T) -> Self {
+    unsafe fn new_temp(obj: T) -> Self {
         SelfRepr(obj)
     }
 
-    unsafe fn temp_to_shared(&self) -> T {
+    fn get(&self) -> T {
         self.0.clone()
     }
 }
 
 impl<T: Clone> AlwaysShared for SelfRepr<T> {}
 
-// SAFETY: Trivially satisfied because the `temp_to_shared` implementation isn't actually unsafe.
-unsafe impl<T: Clone + PartialEq> TempReprMutCmp for SelfRepr<T> {}
+// SAFETY: Trivially satisfied because the `get` implementation isn't actually unsafe.
+unsafe impl<T: Clone> TempReprMutChk for SelfRepr<T> {
+    type SwapChkData = ();
+
+    fn swap_chk_data(&self) -> Self::SwapChkData {}
+}
 
 /*******************
  * TempRef<T> [&T] *
@@ -655,33 +582,83 @@ pub struct TempRef<T: ?Sized>(NonNull<T>);
 unsafe impl<T: ?Sized> TempRepr for TempRef<T> {
     type Shared<'a> = &'a T where Self: 'a;
 
-    fn shared_to_temp(obj: Self::Shared<'_>) -> Self {
+    unsafe fn new_temp(obj: Self::Shared<'_>) -> Self {
         TempRef(obj.into())
     }
 
-    unsafe fn temp_to_shared(&self) -> Self::Shared<'_> {
-        // SAFETY: The safety rules of `temp_to_shared` ensure that this call is valid.
-        self.0.as_ref()
+    fn get(&self) -> Self::Shared<'_> {
+        // SAFETY: The safety rules of `new_temp` and `new_temp_mut` ensure that this call is valid.
+        unsafe { self.0.as_ref() }
     }
 }
 
 impl<T: ?Sized> AlwaysShared for TempRef<T> {}
 
-impl<T: ?Sized> Clone for TempRef<T> {
-    fn clone(&self) -> Self {
-        TempRef(self.0)
-    }
-}
-
-impl<T: ?Sized> PartialEq for TempRef<T> {
-    fn eq(&self, other: &Self) -> bool {
-        ptr::eq(self.0.as_ptr(), other.0.as_ptr())
-    }
-}
-
 // SAFETY: Equal pointers to the same type must point to the same object, unless the object is
 // zero-size.
-unsafe impl<T: ?Sized> TempReprMutCmp for TempRef<T> {}
+unsafe impl<T: ?Sized> TempReprMutChk for TempRef<T> {
+    type SwapChkData = NonNull<T>;
+
+    fn swap_chk_data(&self) -> Self::SwapChkData {
+        self.0
+    }
+}
+
+impl<T: ?Sized> Deref for TempRef<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.get()
+    }
+}
+
+impl<T: ?Sized + PartialEq> PartialEq for TempRef<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
+
+impl<T: ?Sized + Eq> Eq for TempRef<T> {}
+
+impl<T: ?Sized + PartialOrd> PartialOrd for TempRef<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.get().partial_cmp(other.get())
+    }
+
+    fn lt(&self, other: &Self) -> bool {
+        self.get() < other.get()
+    }
+
+    fn le(&self, other: &Self) -> bool {
+        self.get() <= other.get()
+    }
+
+    fn gt(&self, other: &Self) -> bool {
+        self.get() > other.get()
+    }
+
+    fn ge(&self, other: &Self) -> bool {
+        self.get() >= other.get()
+    }
+}
+
+impl<T: ?Sized + Ord> Ord for TempRef<T> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.get().cmp(other.get())
+    }
+}
+
+impl<T: ?Sized + Hash> Hash for TempRef<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.get().hash(state);
+    }
+}
+
+impl<T: ?Sized + Debug> Debug for TempRef<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(f)
+    }
+}
 
 // SAFETY: `TempRef<T>` follows the same rules as `&T` regarding thread safety.
 unsafe impl<T: ?Sized + Sync> Send for TempRef<T> {}
@@ -694,20 +671,20 @@ unsafe impl<T: ?Sized + Sync> Sync for TempRef<T> {}
 /// The canonical implementation of [`TempReprMut`], representing a single mutable reference.
 ///
 /// This is not necessarily very useful on its own, but forms the basis of composition via tuples.
-pub struct TempRefMut<T: ?Sized>(NonNull<T>, PhantomData<fn(T) -> T>);
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TempRefMut<T: ?Sized>(TempRef<T>, PhantomData<*mut T>);
 
 // SAFETY: The safety rules of `TempRepr` are canonically satisfied by conversions between
 // shared references and pointers.
 unsafe impl<T: ?Sized> TempRepr for TempRefMut<T> {
     type Shared<'a> = &'a T where Self: 'a;
 
-    fn shared_to_temp(obj: Self::Shared<'_>) -> Self {
-        TempRefMut(obj.into(), PhantomData)
+    unsafe fn new_temp(obj: Self::Shared<'_>) -> Self {
+        TempRefMut(TempRef::new_temp(obj), PhantomData)
     }
 
-    unsafe fn temp_to_shared(&self) -> Self::Shared<'_> {
-        // SAFETY: The safety rules of `temp_to_shared` ensure that this call is valid.
-        self.0.as_ref()
+    fn get(&self) -> Self::Shared<'_> {
+        self.0.get()
     }
 }
 
@@ -719,31 +696,50 @@ unsafe impl<T: ?Sized> TempRepr for TempRefMut<T> {
 unsafe impl<T: ?Sized> TempReprMut for TempRefMut<T> {
     type Mutable<'a> = &'a mut T where Self: 'a;
 
-    fn mut_to_temp(obj: Self::Mutable<'_>) -> Self {
-        TempRefMut(obj.into(), PhantomData)
+    unsafe fn new_temp_mut(obj: Self::Mutable<'_>) -> Self {
+        TempRefMut(TempRef(obj.into()), PhantomData)
     }
 
-    unsafe fn temp_to_mut(&mut self) -> Self::Mutable<'_> {
-        // SAFETY: The safety rules of `temp_to_mut` ensure that this call is valid.
-        self.0.as_mut()
+    fn get_mut(&mut self) -> Self::Mutable<'_> {
+        // SAFETY: The safety rules of `new_temp` and `new_temp_mut` ensure that this call is valid.
+        unsafe { self.0 .0.as_mut() }
     }
-}
 
-impl<T: ?Sized> Clone for TempRefMut<T> {
-    fn clone(&self) -> Self {
-        TempRefMut(self.0, self.1)
-    }
-}
-
-impl<T: ?Sized> PartialEq for TempRefMut<T> {
-    fn eq(&self, other: &Self) -> bool {
-        ptr::eq(self.0.as_ptr(), other.0.as_ptr())
+    fn get_mut_pinned(mut self: Pin<&mut Self>) -> Self::Mutable<'_> {
+        // SAFETY: The safety rules of `new_temp` and `new_temp_mut` ensure that this call is valid.
+        unsafe { self.0 .0.as_mut() }
     }
 }
 
 // SAFETY: Equal pointers to the same type must point to the same object, unless the object is
 // zero-size.
-unsafe impl<T: ?Sized> TempReprMutCmp for TempRefMut<T> {}
+unsafe impl<T: ?Sized> TempReprMutChk for TempRefMut<T> {
+    type SwapChkData = NonNull<T>;
+
+    fn swap_chk_data(&self) -> Self::SwapChkData {
+        self.0.swap_chk_data()
+    }
+}
+
+impl<T: ?Sized> Deref for TempRefMut<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.get()
+    }
+}
+
+impl<T: ?Sized> DerefMut for TempRefMut<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.get_mut()
+    }
+}
+
+impl<T: ?Sized + Debug> Debug for TempRefMut<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(f)
+    }
+}
 
 // SAFETY: `TempRefMut<T>` follows the same rules as `&mut T` regarding thread safety.
 unsafe impl<T: ?Sized + Send> Send for TempRefMut<T> {}
@@ -754,20 +750,20 @@ unsafe impl<T: ?Sized + Sync> Sync for TempRefMut<T> {}
  *******************************/
 
 /// Similar to [`TempRefMut`], but represents a pinned mutable reference.
-pub struct TempRefPin<T: ?Sized>(NonNull<T>, PhantomData<fn(T) -> T>);
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TempRefPin<T: ?Sized>(TempRefMut<T>);
 
 // SAFETY: The safety rules of `TempRepr` are canonically satisfied by conversions between
 // shared references and pointers.
 unsafe impl<T: ?Sized> TempRepr for TempRefPin<T> {
     type Shared<'a> = &'a T where Self: 'a;
 
-    fn shared_to_temp(obj: Self::Shared<'_>) -> Self {
-        TempRefPin(obj.into(), PhantomData)
+    unsafe fn new_temp(obj: Self::Shared<'_>) -> Self {
+        TempRefPin(TempRefMut::new_temp(obj))
     }
 
-    unsafe fn temp_to_shared(&self) -> Self::Shared<'_> {
-        // SAFETY: The safety rules of `temp_to_shared` ensure that this call is valid.
-        self.0.as_ref()
+    fn get(&self) -> Self::Shared<'_> {
+        self.0.get()
     }
 }
 
@@ -779,37 +775,41 @@ unsafe impl<T: ?Sized> TempRepr for TempRefPin<T> {
 unsafe impl<T: ?Sized> TempReprMut for TempRefPin<T> {
     type Mutable<'a> = Pin<&'a mut T> where Self: 'a;
 
-    fn mut_to_temp(obj: Self::Mutable<'_>) -> Self {
-        // SAFETY: Converting a pinned reference to a pointer is obviously unproblematic as long as
-        // we only convert it back to a pinned or shared reference.
-        unsafe { TempRefPin(obj.get_unchecked_mut().into(), PhantomData) }
+    unsafe fn new_temp_mut(obj: Self::Mutable<'_>) -> Self {
+        // SAFETY: Converting a pinned reference to a pointer is unproblematic as long as we only
+        // convert it back to a pinned or shared reference.
+        TempRefPin(TempRefMut::new_temp_mut(obj.get_unchecked_mut()))
     }
 
-    unsafe fn temp_to_mut(&mut self) -> Self::Mutable<'_> {
-        // SAFETY: The safety rules of `temp_to_mut` ensure that this call is valid.
-        Pin::new_unchecked(self.0.as_mut())
-    }
-}
-
-impl<T: ?Sized> Clone for TempRefPin<T> {
-    fn clone(&self) -> Self {
-        TempRefPin(self.0, self.1)
-    }
-}
-
-impl<T: ?Sized> PartialEq for TempRefPin<T> {
-    fn eq(&self, other: &Self) -> bool {
-        ptr::eq(self.0.as_ptr(), other.0.as_ptr())
+    fn get_mut(&mut self) -> Self::Mutable<'_> {
+        // SAFETY: The safety rules of `new_temp` and `new_temp_mut` ensure that this call is valid.
+        unsafe { Pin::new_unchecked(self.0.get_mut()) }
     }
 }
 
 // SAFETY: Equal pointers to the same type must point to the same object, unless the object is
 // zero-size.
-unsafe impl<T: ?Sized> TempReprMutCmp for TempRefPin<T> {}
+unsafe impl<T: ?Sized> TempReprMutChk for TempRefPin<T> {
+    type SwapChkData = NonNull<T>;
 
-// SAFETY: `TempRefPin<T>` follows the same rules as `Pin<&mut T>` regarding thread safety.
-unsafe impl<T: ?Sized + Send> Send for TempRefPin<T> {}
-unsafe impl<T: ?Sized + Sync> Sync for TempRefPin<T> {}
+    fn swap_chk_data(&self) -> Self::SwapChkData {
+        self.0.swap_chk_data()
+    }
+}
+
+impl<T: ?Sized> Deref for TempRefPin<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.get()
+    }
+}
+
+impl<T: ?Sized + Debug> Debug for TempRefPin<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(f)
+    }
+}
 
 /***********************
  * TempCow<T> [Cow<T>] *
@@ -825,16 +825,16 @@ pub enum TempCow<T: ?Sized + ToOwned> {
 unsafe impl<T: ?Sized + ToOwned<Owned: Clone>> TempRepr for TempCow<T> {
     type Shared<'a> = std::borrow::Cow<'a, T> where Self: 'a;
 
-    fn shared_to_temp(obj: Self::Shared<'_>) -> Self {
+    unsafe fn new_temp(obj: Self::Shared<'_>) -> Self {
         match obj {
-            std::borrow::Cow::Borrowed(obj) => TempCow::Borrowed(TempRef::shared_to_temp(obj)),
+            std::borrow::Cow::Borrowed(obj) => TempCow::Borrowed(TempRef::new_temp(obj)),
             std::borrow::Cow::Owned(obj) => TempCow::Owned(obj),
         }
     }
 
-    unsafe fn temp_to_shared(&self) -> Self::Shared<'_> {
+    fn get(&self) -> Self::Shared<'_> {
         match self {
-            TempCow::Borrowed(temp) => std::borrow::Cow::Borrowed(temp.temp_to_shared()),
+            TempCow::Borrowed(temp) => std::borrow::Cow::Borrowed(temp.get()),
             TempCow::Owned(temp) => std::borrow::Cow::Owned(temp.clone()),
         }
     }
@@ -843,31 +843,19 @@ unsafe impl<T: ?Sized + ToOwned<Owned: Clone>> TempRepr for TempCow<T> {
 #[cfg(feature = "std")]
 impl<T: ?Sized + ToOwned<Owned: Clone>> AlwaysShared for TempCow<T> {}
 
-#[cfg(feature = "std")]
-impl<T: ?Sized + ToOwned<Owned: Clone>> Clone for TempCow<T> {
-    fn clone(&self) -> Self {
-        match self {
-            TempCow::Borrowed(temp) => TempCow::Borrowed(temp.clone()),
-            TempCow::Owned(temp) => TempCow::Owned(temp.clone()),
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl<T: ?Sized + ToOwned<Owned: Clone + PartialEq>> PartialEq for TempCow<T> {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (TempCow::Borrowed(l0), TempCow::Borrowed(r0)) => l0 == r0,
-            (TempCow::Owned(l0), TempCow::Owned(r0)) => l0 == r0,
-            _ => false,
-        }
-    }
-}
-
 // SAFETY: Note that we only care about the case where both instances are borrowed. In particular,
 // `eq` never returns `true` when one instance is borrowed and the other is owned.
 #[cfg(feature = "std")]
-unsafe impl<T: ?Sized + ToOwned<Owned: Clone + PartialEq>> TempReprMutCmp for TempCow<T> {}
+unsafe impl<T: ?Sized + ToOwned<Owned: Clone>> TempReprMutChk for TempCow<T> {
+    type SwapChkData = Option<NonNull<T>>;
+
+    fn swap_chk_data(&self) -> Self::SwapChkData {
+        match self {
+            TempCow::Borrowed(temp) => Some(temp.swap_chk_data()),
+            TempCow::Owned(_) => None,
+        }
+    }
+}
 
 /*************
  * Option<T> *
@@ -876,28 +864,38 @@ unsafe impl<T: ?Sized + ToOwned<Owned: Clone + PartialEq>> TempReprMutCmp for Te
 unsafe impl<T: TempRepr> TempRepr for Option<T> {
     type Shared<'a> = Option<T::Shared<'a>> where Self: 'a;
 
-    fn shared_to_temp(obj: Self::Shared<'_>) -> Self {
-        obj.map(T::shared_to_temp)
+    unsafe fn new_temp(obj: Self::Shared<'_>) -> Self {
+        Some(T::new_temp(obj?))
     }
 
-    unsafe fn temp_to_shared(&self) -> Self::Shared<'_> {
-        Some(self.as_ref()?.temp_to_shared())
+    fn get(&self) -> Self::Shared<'_> {
+        Some(self.as_ref()?.get())
     }
 }
 
 unsafe impl<T: TempReprMut> TempReprMut for Option<T> {
     type Mutable<'a> = Option<T::Mutable<'a>> where Self: 'a;
 
-    fn mut_to_temp(obj: Self::Mutable<'_>) -> Self {
-        obj.map(T::mut_to_temp)
+    unsafe fn new_temp_mut(obj: Self::Mutable<'_>) -> Self {
+        Some(T::new_temp_mut(obj?))
     }
 
-    unsafe fn temp_to_mut(&mut self) -> Self::Mutable<'_> {
-        Some(self.as_mut()?.temp_to_mut())
+    fn get_mut(&mut self) -> Self::Mutable<'_> {
+        Some(self.as_mut()?.get_mut())
+    }
+
+    fn get_mut_pinned(self: Pin<&mut Self>) -> Self::Mutable<'_> {
+        Some(self.as_pin_mut()?.get_mut_pinned())
     }
 }
 
-unsafe impl<T: TempReprMutCmp> TempReprMutCmp for Option<T> {}
+unsafe impl<T: TempReprMutChk> TempReprMutChk for Option<T> {
+    type SwapChkData = Option<T::SwapChkData>;
+
+    fn swap_chk_data(&self) -> Self::SwapChkData {
+        self.as_ref().map(T::swap_chk_data)
+    }
+}
 
 /*****************
  * (T0, T1, ...) *
@@ -910,12 +908,12 @@ macro_rules! impl_temp_repr_tuple {
             type Shared<'a> = ($($T::Shared<'a>,)*) where Self: 'a;
 
             #[allow(unused_variables)]
-            fn shared_to_temp(obj: Self::Shared<'_>) -> Self {
-                ($($T::shared_to_temp(obj.$idx),)*)
+            unsafe fn new_temp(obj: Self::Shared<'_>) -> Self {
+                ($($T::new_temp(obj.$idx),)*)
             }
 
-            unsafe fn temp_to_shared(&self) -> Self::Shared<'_> {
-                ($(self.$idx.temp_to_shared(),)*)
+            fn get(&self) -> Self::Shared<'_> {
+                ($(self.$idx.get(),)*)
             }
         }
 
@@ -924,16 +922,23 @@ macro_rules! impl_temp_repr_tuple {
             type Mutable<'a> = ($($T::Mutable<'a>,)*) where Self: 'a;
 
             #[allow(unused_variables)]
-            fn mut_to_temp(obj: Self::Mutable<'_>) -> Self {
-                ($($T::mut_to_temp(obj.$idx),)*)
+            unsafe fn new_temp_mut(obj: Self::Mutable<'_>) -> Self {
+                ($($T::new_temp_mut(obj.$idx),)*)
             }
 
-            unsafe fn temp_to_mut(&mut self) -> Self::Mutable<'_> {
-                ($(self.$idx.temp_to_mut(),)*)
+            fn get_mut(&mut self) -> Self::Mutable<'_> {
+                ($(self.$idx.get_mut(),)*)
             }
         }
 
-        unsafe impl<$($T: TempReprMutCmp),*> TempReprMutCmp for ($($T,)*) {}
+        #[allow(clippy::unused_unit)]
+        unsafe impl<$($T: TempReprMutChk),*> TempReprMutChk for ($($T,)*) {
+            type SwapChkData = ($($T::SwapChkData,)*);
+
+            fn swap_chk_data(&self) -> Self::SwapChkData {
+                ($(self.$idx.swap_chk_data(),)*)
+            }
+        }
     };
 }
 
@@ -959,17 +964,17 @@ impl_temp_repr_tuple!(0 T0, 1 T1, 2 T2, 3 T3, 4 T4, 5 T5, 6 T6, 7 T7, 8 T8, 9 T9
 unsafe impl<T0: TempRepr, T1: TempRepr> TempRepr for either::Either<T0, T1> {
     type Shared<'a> = either::Either<T0::Shared<'a>, T1::Shared<'a>> where Self: 'a;
 
-    fn shared_to_temp(obj: Self::Shared<'_>) -> Self {
+    unsafe fn new_temp(obj: Self::Shared<'_>) -> Self {
         match obj {
-            either::Either::Left(obj0) => either::Either::Left(T0::shared_to_temp(obj0)),
-            either::Either::Right(obj1) => either::Either::Right(T1::shared_to_temp(obj1)),
+            either::Either::Left(obj0) => either::Either::Left(T0::new_temp(obj0)),
+            either::Either::Right(obj1) => either::Either::Right(T1::new_temp(obj1)),
         }
     }
 
-    unsafe fn temp_to_shared(&self) -> Self::Shared<'_> {
+    fn get(&self) -> Self::Shared<'_> {
         match self {
-            either::Either::Left(self0) => either::Either::Left(self0.temp_to_shared()),
-            either::Either::Right(self1) => either::Either::Right(self1.temp_to_shared()),
+            either::Either::Left(self0) => either::Either::Left(self0.get()),
+            either::Either::Right(self1) => either::Either::Right(self1.get()),
         }
     }
 }
@@ -978,23 +983,32 @@ unsafe impl<T0: TempRepr, T1: TempRepr> TempRepr for either::Either<T0, T1> {
 unsafe impl<T0: TempReprMut, T1: TempReprMut> TempReprMut for either::Either<T0, T1> {
     type Mutable<'a> = either::Either<T0::Mutable<'a>, T1::Mutable<'a>> where Self: 'a;
 
-    fn mut_to_temp(obj: Self::Mutable<'_>) -> Self {
+    unsafe fn new_temp_mut(obj: Self::Mutable<'_>) -> Self {
         match obj {
-            either::Either::Left(obj0) => either::Either::Left(T0::mut_to_temp(obj0)),
-            either::Either::Right(obj1) => either::Either::Right(T1::mut_to_temp(obj1)),
+            either::Either::Left(obj0) => either::Either::Left(T0::new_temp_mut(obj0)),
+            either::Either::Right(obj1) => either::Either::Right(T1::new_temp_mut(obj1)),
         }
     }
 
-    unsafe fn temp_to_mut(&mut self) -> Self::Mutable<'_> {
+    fn get_mut(&mut self) -> Self::Mutable<'_> {
         match self {
-            either::Either::Left(self0) => either::Either::Left(self0.temp_to_mut()),
-            either::Either::Right(self1) => either::Either::Right(self1.temp_to_mut()),
+            either::Either::Left(self0) => either::Either::Left(self0.get_mut()),
+            either::Either::Right(self1) => either::Either::Right(self1.get_mut()),
         }
     }
 }
 
 #[cfg(feature = "either")]
-unsafe impl<T0: TempReprMutCmp, T1: TempReprMutCmp> TempReprMutCmp for either::Either<T0, T1> {}
+unsafe impl<T0: TempReprMutChk, T1: TempReprMutChk> TempReprMutChk for either::Either<T0, T1> {
+    type SwapChkData = either::Either<T0::SwapChkData, T1::SwapChkData>;
+
+    fn swap_chk_data(&self) -> Self::SwapChkData {
+        match self {
+            either::Either::Left(self0) => either::Either::Left(self0.swap_chk_data()),
+            either::Either::Right(self1) => either::Either::Right(self1.swap_chk_data()),
+        }
+    }
+}
 
 /************
  * Range<T> *
@@ -1003,28 +1017,34 @@ unsafe impl<T0: TempReprMutCmp, T1: TempReprMutCmp> TempReprMutCmp for either::E
 unsafe impl<T: TempRepr> TempRepr for Range<T> {
     type Shared<'a> = Range<T::Shared<'a>> where Self: 'a;
 
-    fn shared_to_temp(obj: Self::Shared<'_>) -> Self {
-        T::shared_to_temp(obj.start)..T::shared_to_temp(obj.end)
+    unsafe fn new_temp(obj: Self::Shared<'_>) -> Self {
+        T::new_temp(obj.start)..T::new_temp(obj.end)
     }
 
-    unsafe fn temp_to_shared(&self) -> Self::Shared<'_> {
-        self.start.temp_to_shared()..self.end.temp_to_shared()
+    fn get(&self) -> Self::Shared<'_> {
+        self.start.get()..self.end.get()
     }
 }
 
 unsafe impl<T: TempReprMut> TempReprMut for Range<T> {
     type Mutable<'a> = Range<T::Mutable<'a>> where Self: 'a;
 
-    fn mut_to_temp(obj: Self::Mutable<'_>) -> Self {
-        T::mut_to_temp(obj.start)..T::mut_to_temp(obj.end)
+    unsafe fn new_temp_mut(obj: Self::Mutable<'_>) -> Self {
+        T::new_temp_mut(obj.start)..T::new_temp_mut(obj.end)
     }
 
-    unsafe fn temp_to_mut(&mut self) -> Self::Mutable<'_> {
-        self.start.temp_to_mut()..self.end.temp_to_mut()
+    fn get_mut(&mut self) -> Self::Mutable<'_> {
+        self.start.get_mut()..self.end.get_mut()
     }
 }
 
-unsafe impl<T: TempReprMutCmp> TempReprMutCmp for Range<T> {}
+unsafe impl<T: TempReprMutChk> TempReprMutChk for Range<T> {
+    type SwapChkData = Range<T::SwapChkData>;
+
+    fn swap_chk_data(&self) -> Self::SwapChkData {
+        self.start.swap_chk_data()..self.end.swap_chk_data()
+    }
+}
 
 /****************
  * RangeFrom<T> *
@@ -1033,28 +1053,34 @@ unsafe impl<T: TempReprMutCmp> TempReprMutCmp for Range<T> {}
 unsafe impl<T: TempRepr> TempRepr for RangeFrom<T> {
     type Shared<'a> = RangeFrom<T::Shared<'a>> where Self: 'a;
 
-    fn shared_to_temp(obj: Self::Shared<'_>) -> Self {
-        T::shared_to_temp(obj.start)..
+    unsafe fn new_temp(obj: Self::Shared<'_>) -> Self {
+        T::new_temp(obj.start)..
     }
 
-    unsafe fn temp_to_shared(&self) -> Self::Shared<'_> {
-        self.start.temp_to_shared()..
+    fn get(&self) -> Self::Shared<'_> {
+        self.start.get()..
     }
 }
 
 unsafe impl<T: TempReprMut> TempReprMut for RangeFrom<T> {
     type Mutable<'a> = RangeFrom<T::Mutable<'a>> where Self: 'a;
 
-    fn mut_to_temp(obj: Self::Mutable<'_>) -> Self {
-        T::mut_to_temp(obj.start)..
+    unsafe fn new_temp_mut(obj: Self::Mutable<'_>) -> Self {
+        T::new_temp_mut(obj.start)..
     }
 
-    unsafe fn temp_to_mut(&mut self) -> Self::Mutable<'_> {
-        self.start.temp_to_mut()..
+    fn get_mut(&mut self) -> Self::Mutable<'_> {
+        self.start.get_mut()..
     }
 }
 
-unsafe impl<T: TempReprMutCmp> TempReprMutCmp for RangeFrom<T> {}
+unsafe impl<T: TempReprMutChk> TempReprMutChk for RangeFrom<T> {
+    type SwapChkData = RangeFrom<T::SwapChkData>;
+
+    fn swap_chk_data(&self) -> Self::SwapChkData {
+        self.start.swap_chk_data()..
+    }
+}
 
 /**************
  * RangeTo<T> *
@@ -1063,28 +1089,34 @@ unsafe impl<T: TempReprMutCmp> TempReprMutCmp for RangeFrom<T> {}
 unsafe impl<T: TempRepr> TempRepr for RangeTo<T> {
     type Shared<'a> = RangeTo<T::Shared<'a>> where Self: 'a;
 
-    fn shared_to_temp(obj: Self::Shared<'_>) -> Self {
-        ..T::shared_to_temp(obj.end)
+    unsafe fn new_temp(obj: Self::Shared<'_>) -> Self {
+        ..T::new_temp(obj.end)
     }
 
-    unsafe fn temp_to_shared(&self) -> Self::Shared<'_> {
-        ..self.end.temp_to_shared()
+    fn get(&self) -> Self::Shared<'_> {
+        ..self.end.get()
     }
 }
 
 unsafe impl<T: TempReprMut> TempReprMut for RangeTo<T> {
     type Mutable<'a> = RangeTo<T::Mutable<'a>> where Self: 'a;
 
-    fn mut_to_temp(obj: Self::Mutable<'_>) -> Self {
-        ..T::mut_to_temp(obj.end)
+    unsafe fn new_temp_mut(obj: Self::Mutable<'_>) -> Self {
+        ..T::new_temp_mut(obj.end)
     }
 
-    unsafe fn temp_to_mut(&mut self) -> Self::Mutable<'_> {
-        ..self.end.temp_to_mut()
+    fn get_mut(&mut self) -> Self::Mutable<'_> {
+        ..self.end.get_mut()
     }
 }
 
-unsafe impl<T: TempReprMutCmp> TempReprMutCmp for RangeTo<T> {}
+unsafe impl<T: TempReprMutChk> TempReprMutChk for RangeTo<T> {
+    type SwapChkData = RangeTo<T::SwapChkData>;
+
+    fn swap_chk_data(&self) -> Self::SwapChkData {
+        ..self.end.swap_chk_data()
+    }
+}
 
 /*************
  * RangeFull *
@@ -1093,11 +1125,11 @@ unsafe impl<T: TempReprMutCmp> TempReprMutCmp for RangeTo<T> {}
 unsafe impl TempRepr for RangeFull {
     type Shared<'a> = RangeFull where Self: 'a;
 
-    fn shared_to_temp(_obj: RangeFull) -> Self {
+    unsafe fn new_temp(_obj: RangeFull) -> Self {
         ..
     }
 
-    unsafe fn temp_to_shared(&self) -> RangeFull {
+    fn get(&self) -> RangeFull {
         ..
     }
 }
@@ -1105,16 +1137,22 @@ unsafe impl TempRepr for RangeFull {
 unsafe impl TempReprMut for RangeFull {
     type Mutable<'a> = RangeFull where Self: 'a;
 
-    fn mut_to_temp(_obj: RangeFull) -> Self {
+    unsafe fn new_temp_mut(_obj: RangeFull) -> Self {
         ..
     }
 
-    unsafe fn temp_to_mut(&mut self) -> RangeFull {
+    fn get_mut(&mut self) -> RangeFull {
         ..
     }
 }
 
-unsafe impl TempReprMutCmp for RangeFull {}
+unsafe impl TempReprMutChk for RangeFull {
+    type SwapChkData = RangeFull;
+
+    fn swap_chk_data(&self) -> Self::SwapChkData {
+        ..
+    }
+}
 
 /****************
  * Mapped types *
@@ -1130,7 +1168,7 @@ pub mod mapped {
     /// same as `Self::Mutable<'static>`. Then [`MappedTempRepr<T>`] can be used as the argument of
     /// [`TempInst`].
     pub trait HasTempRepr {
-        type Temp: TempReprMutCmp;
+        type Temp: TempReprMutChk;
 
         type Shared<'a>
         where
@@ -1155,40 +1193,101 @@ pub mod mapped {
     unsafe impl<T: HasTempRepr> TempRepr for MappedTempRepr<T> {
         type Shared<'a> = T::Shared<'a> where Self: 'a;
 
-        fn shared_to_temp(obj: Self::Shared<'_>) -> Self {
-            MappedTempRepr(T::Temp::shared_to_temp(T::shared_to_mapped(obj)))
+        unsafe fn new_temp(obj: Self::Shared<'_>) -> Self {
+            MappedTempRepr(T::Temp::new_temp(T::shared_to_mapped(obj)))
         }
 
-        unsafe fn temp_to_shared(&self) -> Self::Shared<'_> {
-            T::mapped_to_shared(self.0.temp_to_shared())
+        fn get(&self) -> Self::Shared<'_> {
+            T::mapped_to_shared(self.0.get())
         }
     }
 
     unsafe impl<T: HasTempRepr> TempReprMut for MappedTempRepr<T> {
         type Mutable<'a> = T::Mutable<'a> where Self: 'a;
 
-        fn mut_to_temp(obj: Self::Mutable<'_>) -> Self {
-            MappedTempRepr(T::Temp::mut_to_temp(T::mut_to_mapped(obj)))
+        unsafe fn new_temp_mut(obj: Self::Mutable<'_>) -> Self {
+            MappedTempRepr(T::Temp::new_temp_mut(T::mut_to_mapped(obj)))
         }
 
-        unsafe fn temp_to_mut(&mut self) -> Self::Mutable<'_> {
-            T::mapped_to_mut(self.0.temp_to_mut())
+        fn get_mut(&mut self) -> Self::Mutable<'_> {
+            T::mapped_to_mut(self.0.get_mut())
         }
-    }
 
-    impl<T: HasTempRepr> Clone for MappedTempRepr<T> {
-        fn clone(&self) -> Self {
-            MappedTempRepr(self.0.clone())
+        fn get_mut_pinned(self: Pin<&mut Self>) -> Self::Mutable<'_> {
+            unsafe { T::mapped_to_mut(self.map_unchecked_mut(|temp| &mut temp.0).get_mut_pinned()) }
         }
     }
 
-    impl<T: HasTempRepr> PartialEq for MappedTempRepr<T> {
+    unsafe impl<T: HasTempRepr> TempReprMutChk for MappedTempRepr<T> {
+        type SwapChkData = <T::Temp as TempReprMutChk>::SwapChkData;
+
+        fn swap_chk_data(&self) -> Self::SwapChkData {
+            self.0.swap_chk_data()
+        }
+    }
+
+    impl<T: HasTempRepr> PartialEq for MappedTempRepr<T>
+    where
+        for<'a> T::Shared<'a>: PartialEq,
+    {
         fn eq(&self, other: &Self) -> bool {
-            self.0 == other.0
+            self.get() == other.get()
         }
     }
 
-    unsafe impl<T: HasTempRepr> TempReprMutCmp for MappedTempRepr<T> {}
+    impl<T: HasTempRepr> Eq for MappedTempRepr<T> where for<'a> T::Shared<'a>: Eq {}
+
+    impl<T: HasTempRepr> PartialOrd for MappedTempRepr<T>
+    where
+        for<'a> T::Shared<'a>: PartialOrd,
+    {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            self.get().partial_cmp(&other.get())
+        }
+
+        fn lt(&self, other: &Self) -> bool {
+            self.get() < other.get()
+        }
+
+        fn le(&self, other: &Self) -> bool {
+            self.get() <= other.get()
+        }
+
+        fn gt(&self, other: &Self) -> bool {
+            self.get() > other.get()
+        }
+
+        fn ge(&self, other: &Self) -> bool {
+            self.get() >= other.get()
+        }
+    }
+
+    impl<T: HasTempRepr> Ord for MappedTempRepr<T>
+    where
+        for<'a> T::Shared<'a>: Ord,
+    {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.get().cmp(&other.get())
+        }
+    }
+
+    impl<T: HasTempRepr> Hash for MappedTempRepr<T>
+    where
+        for<'a> T::Shared<'a>: Hash,
+    {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.get().hash(state);
+        }
+    }
+
+    impl<T: HasTempRepr> Debug for MappedTempRepr<T>
+    where
+        for<'a> T::Shared<'a>: Debug,
+    {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.get().fmt(f)
+        }
+    }
 
     impl<T> HasTempRepr for slice::Iter<'static, T> {
         type Temp = TempRef<[T]>;
@@ -1279,7 +1378,7 @@ mod tests {
         static INIT: std::sync::LazyLock<()> = std::sync::LazyLock::new(|| unsafe {
             set_modification_panic_fn(|| {
                 if !std::thread::panicking() {
-                    panic!("TempInst was modified");
+                    panic!("TempInstMut instance was modified");
                 }
             })
         });
@@ -1293,7 +1392,7 @@ mod tests {
     fn temp_ref() {
         init_tests();
         let mut a = 42;
-        let a_inst = TempInst::<TempRef<i32>>::new_wrapper(&a);
+        let a_inst = TempInst::<TempRef<i32>>::new(&a);
         let a_ref = a_inst.get();
         assert_eq!(*a_ref, 42);
         let double = 2 * *a_ref;
@@ -1336,7 +1435,7 @@ mod tests {
     fn temp_ref_call_mut() {
         init_tests();
         let mut a = 42;
-        let double = TempInst::<TempRefMut<i32>>::call_with_mut(&mut a, |a_inst| {
+        let double = TempInstMut::<TempRefMut<i32>>::call_with(&mut a, |a_inst| {
             let a_ref = a_inst.get_mut();
             assert_eq!(*a_ref, 42);
             *a_ref += 1;
@@ -1351,7 +1450,7 @@ mod tests {
         init_tests();
         let mut a = 42;
         let mut b = 23;
-        let sum = TempInst::<(TempRefMut<i32>, TempRefMut<i32>)>::call_with_mut(
+        let sum = TempInstMut::<(TempRefMut<i32>, TempRefMut<i32>)>::call_with(
             (&mut a, &mut b),
             |a_b_inst| {
                 let (a_ref, b_ref) = a_b_inst.get_mut();
@@ -1373,7 +1472,7 @@ mod tests {
         let mut a = 42;
         let b = 23;
         let sum =
-            TempInst::<(TempRefMut<i32>, TempRef<i32>)>::call_with_mut((&mut a, &b), |a_b_inst| {
+            TempInstMut::<(TempRefMut<i32>, TempRef<i32>)>::call_with((&mut a, &b), |a_b_inst| {
                 let (a_ref, b_ref) = a_b_inst.get_mut();
                 assert_eq!(*a_ref, 42);
                 assert_eq!(*b_ref, 23);
@@ -1389,7 +1488,7 @@ mod tests {
     fn temp_ref_mut_pin() {
         init_tests();
         let mut a = 42;
-        let a_inst = pin!(TempInst::<TempRefMut<i32>>::new_wrapper_pin(&mut a));
+        let a_inst = pin!(TempInstPin::<TempRefMut<i32>>::new(&mut a));
         let a_ref = a_inst.deref_pin().get_mut_pinned();
         assert_eq!(*a_ref, 42);
         *a_ref += 1;
@@ -1402,7 +1501,7 @@ mod tests {
     fn temp_ref_mut_call_pin() {
         init_tests();
         let mut a = 42;
-        let double = TempInst::<TempRefMut<i32>>::call_with_pin(&mut a, |a_inst| {
+        let double = TempInstPin::<TempRefMut<i32>>::call_with(&mut a, |a_inst| {
             let a_ref = a_inst.get_mut_pinned();
             assert_eq!(*a_ref, 42);
             *a_ref += 1;
@@ -1416,7 +1515,7 @@ mod tests {
     fn temp_ref_pin_call_pin() {
         init_tests();
         let mut a = pin!(42);
-        let double = TempInst::<TempRefPin<i32>>::call_with_pin(Pin::as_mut(&mut a), |a_inst| {
+        let double = TempInstPin::<TempRefPin<i32>>::call_with(Pin::as_mut(&mut a), |a_inst| {
             let a_ref = a_inst.get_mut_pinned().get_mut();
             assert_eq!(*a_ref, 42);
             *a_ref += 1;
@@ -1428,13 +1527,13 @@ mod tests {
 
     #[cfg(feature = "std")]
     #[test]
-    #[should_panic(expected = "TempInst was modified")]
+    #[should_panic(expected = "TempInstMut instance was modified")]
     fn temp_ref_call_mut_illegal_swap() {
         init_tests();
         let mut a = 42;
-        TempInst::<TempRefMut<i32>>::call_with_mut(&mut a, |a_inst| {
+        TempInstMut::<TempRefMut<i32>>::call_with(&mut a, |a_inst| {
             let mut b = 43;
-            TempInst::<TempRefMut<i32>>::call_with_mut(&mut b, |b_inst| {
+            TempInstMut::<TempRefMut<i32>>::call_with(&mut b, |b_inst| {
                 swap(a_inst, b_inst);
             });
             // This would cause undefined behavior due to swapping, if undetected.
@@ -1452,8 +1551,8 @@ mod tests {
         // until then.
         init_tests();
         let mut a = ((), ());
-        TempInst::<TempRefMut<()>>::call_with_mut(&mut a.0, |a0_inst| {
-            TempInst::<TempRefMut<()>>::call_with_mut(&mut a.1, |a1_inst| {
+        TempInstMut::<TempRefMut<()>>::call_with(&mut a.0, |a0_inst| {
+            TempInstMut::<TempRefMut<()>>::call_with(&mut a.1, |a1_inst| {
                 swap(a0_inst, a1_inst);
             });
             // This produces multiple mutable references to a.1, which could potentially be
@@ -1470,9 +1569,9 @@ mod tests {
     fn temp_ref_send() {
         init_tests();
         let a = 42;
-        let a_inst = TempInst::<TempRef<i32>>::new_wrapper(&a);
+        let a_inst = TempInst::<TempRef<i32>>::new(&a);
         std::thread::scope(|scope| {
-            let thread = scope.spawn(move || *a_inst.get());
+            let thread = scope.spawn(move || **a_inst);
             let result = thread.join().unwrap();
             assert_eq!(result, 42);
         });
@@ -1483,9 +1582,9 @@ mod tests {
     fn temp_ref_sync() {
         init_tests();
         let a = 42;
-        let a_inst = TempInst::<TempRef<i32>>::new_wrapper(&a);
+        let a_inst = TempInst::<TempRef<i32>>::new(&a);
         std::thread::scope(|scope| {
-            let thread = scope.spawn(|| *a_inst.get());
+            let thread = scope.spawn(|| **a_inst);
             let result = thread.join().unwrap();
             assert_eq!(result, 42);
         });
@@ -1496,9 +1595,9 @@ mod tests {
     fn temp_ref_pin_send() {
         init_tests();
         let a = pin!(42);
-        let a_inst = TempInst::<TempRefPin<i32>>::new_wrapper_pin(a);
+        let a_inst = TempInstPin::<TempRefPin<i32>>::new(a);
         std::thread::scope(|scope| {
-            let thread = scope.spawn(move || *a_inst.get());
+            let thread = scope.spawn(move || **a_inst);
             let result = thread.join().unwrap();
             assert_eq!(result, 42);
         });
@@ -1509,9 +1608,9 @@ mod tests {
     fn temp_ref_pin_sync() {
         init_tests();
         let a = pin!(42);
-        let a_inst = TempInst::<TempRefPin<i32>>::new_wrapper_pin(a);
+        let a_inst = TempInstPin::<TempRefPin<i32>>::new(a);
         std::thread::scope(|scope| {
-            let thread = scope.spawn(|| *a_inst.get());
+            let thread = scope.spawn(|| **a_inst);
             let result = thread.join().unwrap();
             assert_eq!(result, 42);
         });
@@ -1522,9 +1621,9 @@ mod tests {
     fn temp_ref_call_mut_send() {
         init_tests();
         let mut a = 42;
-        TempInst::<TempRefMut<i32>>::call_with_mut(&mut a, |a_inst| {
+        TempInstMut::<TempRefMut<i32>>::call_with(&mut a, |a_inst| {
             std::thread::scope(|scope| {
-                let thread = scope.spawn(move || *a_inst.get_mut() += 1);
+                let thread = scope.spawn(move || **a_inst += 1);
                 thread.join().unwrap();
             })
         });
@@ -1536,9 +1635,9 @@ mod tests {
     fn temp_ref_call_mut_sync() {
         init_tests();
         let mut a = 42;
-        TempInst::<TempRefMut<i32>>::call_with_mut(&mut a, |a_inst| {
+        TempInstMut::<TempRefMut<i32>>::call_with(&mut a, |a_inst| {
             std::thread::scope(|scope| {
-                let thread = scope.spawn(|| *a_inst.get_mut() += 1);
+                let thread = scope.spawn(|| **a_inst += 1);
                 thread.join().unwrap();
             })
         });

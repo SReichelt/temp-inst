@@ -1,13 +1,12 @@
 # temp-inst crate
 
-[`TempInst`](temp-inst/src/lib.rs) is a safe lifetime-erased wrapper for a Rust object (struct,
-enum, tuple, ...) with lifetime parameters. It is intended for use with APIs that require a single
-(shared or mutable) reference to an object that cannot depend on lifetimes (except for the lifetime
-of that single reference).
+This crate provides safe lifetime-erased representations for objects with lifetime parameters.
+Safety is achieved by making the lifetime-erased objects accessible only via short-lived
+references.
 
-For example, `TempInst` can be used to contract a tuple of references into a single reference
-and then later back into a tuple of references. For the full list of types that can be used
-with `TempInst`, see the implementations of the `TempRepr` trait.
+The main use case is to convert multiple (shared or mutable) references into a single reference
+to a lifetime-erased object, which can then be passed to an API that only accepts a single
+reference.
 
 ## Example
 
@@ -31,25 +30,25 @@ impl Foo for Bar {
     // We actually want to use _two_ mutable references as the argument type. However,
     // the associated type `Arg` does not have any lifetime parameter. If we can add a
     // lifetime parameter `'a` to `Bar`, then `type Arg = (&'a mut i32, &'a mut i32)`
-    // will work. If we can't or don't want to do that, an equivalent `TempInst` will
-    // do the trick.
-    type Arg = TempInst<(TempRefMut<i32>, TempRefMut<i32>)>;
+    // will work. If we can't or don't want to do that, a pair of `TempRefMut` will do
+    // the trick.
+    type Arg = (TempRefMut<i32>, TempRefMut<i32>);
 
     fn run(arg: &mut Self::Arg) {
-        // From a mutable `TempInst` reference, we can extract the mutable references
-        // that we originally constructed it from.
-        let (a_ref, b_ref) = arg.get_mut();
-        *a_ref += *b_ref;
-        *b_ref += 1;
+        // The mutable `TempRefMut` references can be dereferenced to obtain the mutable
+        // references that we passed to `call_with` below.
+        let (a_ref, b_ref) = arg;
+        **a_ref += **b_ref;
+        **b_ref += 1;
     }
 }
 
 let mut a = 42;
 let mut b = 23;
 
-// Now we can convert the pair `(&mut a, &mut b)` to a mutable `TempInst` reference,
-// and pass that to `run_twice`.
-TempInst::call_with_mut((&mut a, &mut b), run_twice::<Bar>);
+// Now we can convert the pair `(&mut a, &mut b)` to `&mut Foo::Arg`, and pass that to
+// `run_twice`.
+TempInstMut::call_with((&mut a, &mut b), run_twice::<Bar>);
 
 assert_eq!(a, 42 + 23 + 1 + 23);
 assert_eq!(b, 23 + 1 + 1);
