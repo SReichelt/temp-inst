@@ -12,34 +12,44 @@ with `TempInst`, see the implementations of the `TempRepr` trait.
 ## Example
 
 ```rust
-// We want to use this external function, which takes a single mutable
-// reference to some `T` (with a useless `'static` bound because otherwise
-// there will be a trivial solution).
-fn run_twice<T: 'static>(obj: &mut T, f: fn(&mut T)) {
-    f(obj);
-    f(obj);
+// We want to implement this example trait for a specific type `Bar`, in order to call
+// `run_twice` below.
+pub trait Foo {
+    type Arg;
+
+    fn run(arg: &mut Self::Arg);
 }
 
-// However, here we have two separate variables, and we want to pass references
-// to both of them to `run_twice`. `T = (&mut a, &mut b)` won't work because of
-// the `'static` bound. (In a real-world use case, the problem is usually that
-// `T` cannot have lifetime parameters for some other reason.)
+pub fn run_twice<F: Foo>(arg: &mut F::Arg) {
+    F::run(arg);
+    F::run(arg);
+}
+
+struct Bar;
+
+impl Foo for Bar {
+    // We actually want to use _two_ mutable references as the argument type. However,
+    // the associated type `Arg` does not have any lifetime parameter. If we can add a
+    // lifetime parameter `'a` to `Bar`, then `type Arg = (&'a mut i32, &'a mut i32)`
+    // will work. If we can't or don't want to do that, an equivalent `TempInst` will
+    // do the trick.
+    type Arg = TempInst<(TempRefMut<i32>, TempRefMut<i32>)>;
+
+    fn run(arg: &mut Self::Arg) {
+        // From a mutable `TempInst` reference, we can extract the mutable references
+        // that we originally constructed it from.
+        let (a_ref, b_ref) = arg.get_mut();
+        *a_ref += *b_ref;
+        *b_ref += 1;
+    }
+}
+
 let mut a = 42;
 let mut b = 23;
 
-// The lambda we pass to `call_with_mut` receives a single mutable reference
-// `inst: &mut TempInst<_>` that we can use.
-TempInst::<(TempRefMut<i32>, TempRefMut<i32>)>::call_with_mut(
-    (&mut a, &mut b),
-    |inst| run_twice(inst, |inst| {
-        // Now that we have passed `inst` through the external `run_twice`
-        // function back to our own code, we can extract the original pair of
-        // references from it.
-        let (a_ref, b_ref) = inst.get_mut();
-        *a_ref += *b_ref;
-        *b_ref += 1;
-    }),
-);
+// Now we can convert the pair `(&mut a, &mut b)` to a mutable `TempInst` reference,
+// and pass that to `run_twice`.
+TempInst::call_with_mut((&mut a, &mut b), run_twice::<Bar>);
 
 assert_eq!(a, 42 + 23 + 1 + 23);
 assert_eq!(b, 23 + 1 + 1);
