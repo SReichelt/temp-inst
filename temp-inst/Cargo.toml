@@ -1,13 +1,14 @@
 [package]
 name = "temp-inst"
-version = "0.1.0"
-authors = ["Sebastian Reichelt <SebastianR@gmx.de"]
+version = "1.0.0"
+authors = ["Sebastian Reichelt <SebastianR@gmx.de>"]
 license = "MIT OR Apache-2.0"
 edition = "2021"
 
 [features]
 default = ["std"]
-std = []
+std = ["alloc"]
+alloc = []
 either = ["dep:either"]
 
 [dependencies]

@@ -109,6 +109,9 @@ use core::{
     str::Chars,
 };
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
 use mapped::*;
 
 pub mod temp_stack;
@@ -826,38 +829,38 @@ impl<T: ?Sized + Debug> Debug for TempRefPin<T> {
  * TempCow<T> [Cow<T>] *
  ***********************/
 
-#[cfg(feature = "std")]
-pub enum TempCow<T: ?Sized + ToOwned> {
+#[cfg(feature = "alloc")]
+pub enum TempCow<T: ?Sized + alloc::borrow::ToOwned> {
     Borrowed(TempRef<T>),
     Owned(T::Owned),
 }
 
-#[cfg(feature = "std")]
-unsafe impl<T: ?Sized + ToOwned<Owned: Clone>> TempRepr for TempCow<T> {
-    type Shared<'a> = std::borrow::Cow<'a, T> where Self: 'a;
+#[cfg(feature = "alloc")]
+unsafe impl<T: ?Sized + alloc::borrow::ToOwned<Owned: Clone>> TempRepr for TempCow<T> {
+    type Shared<'a> = alloc::borrow::Cow<'a, T> where Self: 'a;
 
     unsafe fn new_temp(obj: Self::Shared<'_>) -> Self {
         match obj {
-            std::borrow::Cow::Borrowed(obj) => TempCow::Borrowed(TempRef::new_temp(obj)),
-            std::borrow::Cow::Owned(obj) => TempCow::Owned(obj),
+            alloc::borrow::Cow::Borrowed(obj) => TempCow::Borrowed(TempRef::new_temp(obj)),
+            alloc::borrow::Cow::Owned(obj) => TempCow::Owned(obj),
         }
     }
 
     fn get(&self) -> Self::Shared<'_> {
         match self {
-            TempCow::Borrowed(temp) => std::borrow::Cow::Borrowed(temp.get()),
-            TempCow::Owned(temp) => std::borrow::Cow::Owned(temp.clone()),
+            TempCow::Borrowed(temp) => alloc::borrow::Cow::Borrowed(temp.get()),
+            TempCow::Owned(temp) => alloc::borrow::Cow::Owned(temp.clone()),
         }
     }
 }
 
-#[cfg(feature = "std")]
-impl<T: ?Sized + ToOwned<Owned: Clone>> AlwaysShared for TempCow<T> {}
+#[cfg(feature = "alloc")]
+impl<T: ?Sized + alloc::borrow::ToOwned<Owned: Clone>> AlwaysShared for TempCow<T> {}
 
 // SAFETY: Note that we only care about the case where both instances are borrowed. In particular,
 // `eq` never returns `true` when one instance is borrowed and the other is owned.
-#[cfg(feature = "std")]
-unsafe impl<T: ?Sized + ToOwned<Owned: Clone>> TempReprMutChk for TempCow<T> {
+#[cfg(feature = "alloc")]
+unsafe impl<T: ?Sized + alloc::borrow::ToOwned<Owned: Clone>> TempReprMutChk for TempCow<T> {
     type SwapChkData = Option<NonNull<T>>;
 
     fn swap_chk_data(&self) -> Self::SwapChkData {
