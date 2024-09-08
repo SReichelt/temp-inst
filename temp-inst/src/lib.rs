@@ -92,6 +92,8 @@
 //!
 //! assert_eq!(sum_of_products, 42 * 23 + 42 * 23);
 //! ```
+//!
+//! For another use case, see [`temp_stack::TempStack`].
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -109,6 +111,8 @@ use core::{
 
 use mapped::*;
 
+pub mod temp_stack;
+
 /// A wrapper around an instance of `T` which implements [`TempRepr`], i.e. is a temporary
 /// representation of a type `T::Shared<'a>`.
 ///
@@ -116,6 +120,8 @@ use mapped::*;
 /// [`TempInst::new`] for that lifetime; therefore it is logically equivalent to `T::Shared<'a>`.
 /// However, it can hand out references to the lifetime-less type `T` via its [`Deref`]
 /// implementation.
+///
+/// See the module documentation for usage examples.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TempInst<'a, T: TempRepr + 'a>(T, PhantomData<T::Shared<'a>>);
 
@@ -460,6 +466,11 @@ pub unsafe trait TempRepr {
 ///
 /// * `get_mut_pinned` must either have a custom implementation, or the default implementation via
 ///   `get_mut` must be safe.
+///
+/// * The pinning projections that are implemented as part of `get_mut_pinned` in this crate, e.g.
+///   for tuples, must be safe when the type is the target of such a projection. (This is usually
+///   trivial, and e.g. [`Option::as_pin_mut`] already exists in the standard library, but
+///   technically it is not yet automatically the case for tuples.)
 ///
 /// * The above must also hold if a (legal) cast was applied to the result of `new_temp_mut`.
 pub unsafe trait TempReprMut: TempRepr {
@@ -994,6 +1005,13 @@ unsafe impl<T0: TempReprMut, T1: TempReprMut> TempReprMut for either::Either<T0,
         match self {
             either::Either::Left(self0) => either::Either::Left(self0.get_mut()),
             either::Either::Right(self1) => either::Either::Right(self1.get_mut()),
+        }
+    }
+
+    fn get_mut_pinned(self: Pin<&mut Self>) -> Self::Mutable<'_> {
+        match self.as_pin_mut() {
+            either::Either::Left(self0) => either::Either::Left(self0.get_mut_pinned()),
+            either::Either::Right(self1) => either::Either::Right(self1.get_mut_pinned()),
         }
     }
 }
