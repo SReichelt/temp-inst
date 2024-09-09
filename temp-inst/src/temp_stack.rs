@@ -1,3 +1,6 @@
+//! Contains a [`TempStack`] type that can be used to build contexts living on the call stack in a
+//! convenient way.
+
 use core::{iter::FusedIterator, mem::take};
 
 use super::*;
@@ -23,7 +26,7 @@ use super::*;
 ///
 /// ```
 /// # use crate::temp_inst::{*, temp_stack::*};
-///
+/// #
 /// #[derive(Clone, PartialEq, Debug)]
 /// enum Expr {
 ///     Var(usize), // A De Bruijn index that specifies which binder the variable references.
@@ -208,6 +211,7 @@ impl<Root: TempReprMut, Frame: TempReprMut> TempStack<Root, Frame> {
 pub type TempStackRef<'a, Root, Frame> = &'a TempStack<Root, Frame>;
 pub type TempStackRefMut<'a, Root, Frame> = Pin<&'a mut TempStack<Root, Frame>>;
 
+/// The non-lifetime-erased representation of a stack frame within a shared [`TempStack`].
 pub enum StackFrame<'a, Root: TempRepr, Frame: TempRepr> {
     Root {
         data: Root::Shared<'a>,
@@ -218,6 +222,7 @@ pub enum StackFrame<'a, Root: TempRepr, Frame: TempRepr> {
     },
 }
 
+/// The non-lifetime-erased representation of a stack frame within a mutable [`TempStack`].
 pub enum StackFrameMut<'a, Root: TempReprMut, Frame: TempReprMut> {
     Root {
         data: Root::Mutable<'a>,
@@ -285,8 +290,24 @@ unsafe impl<Root: TempReprMut, Frame: TempReprMut> TempReprMut for TempStack<Roo
             },
         }
     }
+
+    fn get_mut_pinned(self: Pin<&mut Self>) -> Self::Mutable<'_> {
+        // SAFETY: This only implements a pinning projection.
+        unsafe {
+            match self.get_unchecked_mut() {
+                TempStack::Root { data } => StackFrameMut::Root {
+                    data: Pin::new_unchecked(data).get_mut_pinned(),
+                },
+                TempStack::Frame { data, parent } => StackFrameMut::Frame {
+                    data: Pin::new_unchecked(data).get_mut_pinned(),
+                    parent: Pin::new_unchecked(parent).get_mut_pinned(),
+                },
+            }
+        }
+    }
 }
 
+/// An iterator over frames of a shared `TempStack`.
 pub struct TempStackIter<'a, Root: TempRepr, Frame: TempRepr>(TempStackRef<'a, Root, Frame>);
 
 impl<'a, Root: TempRepr, Frame: TempRepr> TempStackIter<'a, Root, Frame> {
@@ -335,6 +356,7 @@ impl<'a, Root: TempRepr, Frame: TempRepr> Iterator for TempStackIter<'a, Root, F
 
 impl<'a, Root: TempRepr, Frame: TempRepr> FusedIterator for TempStackIter<'a, Root, Frame> {}
 
+/// An iterator over frames of a mutable `TempStack`.
 pub struct TempStackIterMut<'a, Root: TempReprMut, Frame: TempReprMut>(
     // Note that this should never be `None`, but we temporarily need to extract the value in the
     // `next` method.
@@ -351,14 +373,16 @@ impl<'a, Root: TempReprMut, Frame: TempReprMut> TempStackIterMut<'a, Root, Frame
     /// rest of the stack if it has not.
     pub fn into_root(self) -> Root::Mutable<'a> {
         let mut temp = self.0.unwrap();
-        loop {
-            // SAFETY: This only implements a pinned projection.
-            match unsafe { temp.get_unchecked_mut() } {
-                TempStack::Root { data } => {
-                    return data.get_mut();
-                }
-                TempStack::Frame { parent, .. } => {
-                    temp = parent.get_mut();
+        // SAFETY: This only implements a pinning projection.
+        unsafe {
+            loop {
+                match temp.get_unchecked_mut() {
+                    TempStack::Root { data } => {
+                        return Pin::new_unchecked(data).get_mut_pinned();
+                    }
+                    TempStack::Frame { parent, .. } => {
+                        temp = Pin::new_unchecked(parent).get_mut_pinned();
+                    }
                 }
             }
         }
@@ -371,16 +395,17 @@ impl<'a, Root: TempReprMut, Frame: TempReprMut> Iterator for TempStackIterMut<'a
     fn next(&mut self) -> Option<Self::Item> {
         let temp = take(&mut self.0).unwrap();
         // SAFETY: This only implements a pinned projection.
-        let temp = unsafe { temp.get_unchecked_mut() };
-        match temp {
-            TempStack::Root { .. } => {
-                // SAFETY: We are setting the value we obtained previously.
-                self.0 = unsafe { Some(Pin::new_unchecked(temp)) };
-                None
-            }
-            TempStack::Frame { data, parent } => {
-                self.0 = Some(parent.get_mut());
-                Some(data.get_mut())
+        unsafe {
+            let temp = temp.get_unchecked_mut();
+            match temp {
+                TempStack::Root { .. } => {
+                    self.0 = Some(Pin::new_unchecked(temp));
+                    None
+                }
+                TempStack::Frame { data, parent } => {
+                    self.0 = Some(Pin::new_unchecked(parent).get_mut_pinned());
+                    Some(Pin::new_unchecked(data).get_mut_pinned())
+                }
             }
         }
     }

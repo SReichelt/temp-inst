@@ -7,20 +7,20 @@
 //! reference.
 //!
 //! A lifetime-erased object can be obtained by creating one of [`TempInst`], [`TempInstMut`], or
-//! [`TempInstPin`], and dereferencing it. In the case of [`TempInstMut`], the
-//! [`TempInstMut::call_with`] method should be used because [`TempInstMut::new`] is unsafe.
+//! [`TempInstPin`], and dereferencing it. (In the case of [`TempInstMut`], the
+//! [`TempInstMut::call_with`] method should be used because [`TempInstMut::new`] is unsafe.)
 //!
-//! To see which types have a temporary representation, see the implementations of the [`TempRepr`]
-//! trait. It is possible to add temporary representations for custom types, preferably via
-//! [`mapped::HasTempRepr`].
+//! To find out which types currently have a corresponding temporary representation, see the
+//! implementations of the [`TempRepr`] trait. It is possible to add temporary representations for
+//! custom types, preferably via [`mapped::HasTempRepr`].
 //!
 //! # Examples
 //!
 //! ```
 //! # use crate::temp_inst::*;
-//!
-//! // We want to implement this example trait for a specific type `Bar`, in order to call
-//! // `run_twice` below.
+//! #
+//! // We want to implement this example trait for a specific type `Bar`, in order
+//! // to call `run_twice` below.
 //! pub trait Foo {
 //!     type Arg;
 //!
@@ -35,15 +35,16 @@
 //! struct Bar;
 //!
 //! impl Foo for Bar {
-//!     // We actually want to use _two_ mutable references as the argument type. However, the
-//!     // associated type `Arg` does not have any lifetime parameter. If we can add a lifetime
-//!     // parameter `'a` to `Bar`, then `type Arg = (&'a mut i32, &'a mut i32)` will work. If we
-//!     // can't or don't want to do that, a pair of `TempRefMut` will do the trick.
+//!     // We actually want to use _two_ mutable references as the argument type.
+//!     // However, the associated type `Arg` does not have any lifetime parameter.
+//!     // If we can add a lifetime parameter `'a` to `Bar`, then
+//!     // `type Arg = (&'a mut i32, &'a mut i32)` will work. If we can't or don't
+//!     // want to do that, a pair of `TempRefMut` will do the trick.
 //!     type Arg = (TempRefMut<i32>, TempRefMut<i32>);
 //!
 //!     fn run(arg: &mut Self::Arg) {
-//!         // The mutable `TempRefMut` references can be dereferenced to obtain the mutable
-//!         // references that we passed to `call_with` below.
+//!         // The mutable `TempRefMut` references can be dereferenced to obtain
+//!         // the mutable references that we passed to `call_with` below.
 //!         let (a_ref, b_ref) = arg;
 //!         **a_ref += **b_ref;
 //!         **b_ref += 1;
@@ -53,8 +54,8 @@
 //! let mut a = 42;
 //! let mut b = 23;
 //!
-//! // Now we can convert the pair `(&mut a, &mut b)` to `&mut Foo::Arg`, and pass that to
-//! // `run_twice`.
+//! // Now we can convert the pair `(&mut a, &mut b)` to `&mut Foo::Arg`, and pass
+//! // that to `run_twice`.
 //! TempInstMut::call_with((&mut a, &mut b), run_twice::<Bar>);
 //!
 //! assert_eq!(a, 42 + 23 + 1 + 23);
@@ -65,7 +66,7 @@
 //!
 //! ```
 //! # use crate::temp_inst::*;
-//!
+//! #
 //! pub trait Foo {
 //!     type Arg;
 //!
@@ -95,7 +96,7 @@
 //!
 //! For another use case, see [`temp_stack::TempStack`].
 
-#![cfg_attr(not(feature = "std"), no_std)]
+#![no_std]
 
 use core::{
     cmp::Ordering,
@@ -111,6 +112,9 @@ use core::{
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
+
+#[cfg(feature = "std")]
+extern crate std;
 
 use mapped::*;
 
@@ -367,9 +371,9 @@ impl<T: TempReprMutChk> Drop for TempInstMut<'_, T> {
 
 #[cfg(feature = "std")]
 fn modification_panic_fn() {
-    // Note: Can be replaced by `std::panic::always_abort` once that is stabilized.
+    // Note: Can be replaced with `std::panic::always_abort` once that is stabilized.
     let orig_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
+    std::panic::set_hook(std::boxed::Box::new(move |panic_info| {
         orig_hook(panic_info);
         std::process::abort()
     }));
@@ -467,13 +471,10 @@ pub unsafe trait TempRepr {
 /// * `new_temp_mut<'a>` followed by `get<'b>` must not cause undefined behavior when `'a: 'b` and
 ///   `'b` does not overlap with any lifetime passed to `get_mut` or `get_mut_pinned`.
 ///
-/// * `get_mut_pinned` must either have a custom implementation, or the default implementation via
-///   `get_mut` must be safe.
-///
 /// * The pinning projections that are implemented as part of `get_mut_pinned` in this crate, e.g.
 ///   for tuples, must be safe when the type is the target of such a projection. (This is usually
 ///   trivial, and e.g. [`Option::as_pin_mut`] already exists in the standard library, but
-///   technically it is not yet automatically the case for tuples.)
+///   technically it is not automatically the case for tuples at the moment.)
 ///
 /// * The above must also hold if a (legal) cast was applied to the result of `new_temp_mut`.
 pub unsafe trait TempReprMut: TempRepr {
@@ -498,10 +499,7 @@ pub unsafe trait TempReprMut: TempRepr {
     fn get_mut(&mut self) -> Self::Mutable<'_>;
 
     /// Like [`TempReprMut::get_mut`], but takes a pinned mutable reference to `Self`.
-    fn get_mut_pinned(self: Pin<&mut Self>) -> Self::Mutable<'_> {
-        // SAFETY: See corresponding trait rule.
-        unsafe { self.get_unchecked_mut().get_mut() }
-    }
+    fn get_mut_pinned(self: Pin<&mut Self>) -> Self::Mutable<'_>;
 }
 
 /// An extension of [`TempReprMut`] that allows non-pinned mutable references to be passed to safe
@@ -784,8 +782,8 @@ unsafe impl<T: ?Sized> TempRepr for TempRefPin<T> {
 // SAFETY: The safety rules of `TempReprMut` are canonically satisfied by conversions between
 // mutable references and pointers, and `Pin<Ptr>` is covariant in `Ptr`.
 //
-// The `PhantomData` field guarantees that a `TempRefPin` instance cannot be cast in a covariant
-// way, which `NonNull` would allow but violates the safety rules of `TempReprMut`.
+// The `PhantomData` field in `TempRefMut` guarantees that a `TempRefPin` instance cannot be cast in
+// a covariant way, which `NonNull` would allow but violates the safety rules of `TempReprMut`.
 unsafe impl<T: ?Sized> TempReprMut for TempRefPin<T> {
     type Mutable<'a> = Pin<&'a mut T> where Self: 'a;
 
@@ -798,6 +796,11 @@ unsafe impl<T: ?Sized> TempReprMut for TempRefPin<T> {
     fn get_mut(&mut self) -> Self::Mutable<'_> {
         // SAFETY: The safety rules of `new_temp` and `new_temp_mut` ensure that this call is valid.
         unsafe { Pin::new_unchecked(self.0.get_mut()) }
+    }
+
+    fn get_mut_pinned(self: Pin<&mut Self>) -> Self::Mutable<'_> {
+        // SAFETY: The safety rules of `new_temp` and `new_temp_mut` ensure that this call is valid.
+        unsafe { Pin::new_unchecked(self.map_unchecked_mut(|temp| &mut temp.0).get_mut_pinned()) }
     }
 }
 
@@ -829,6 +832,7 @@ impl<T: ?Sized + Debug> Debug for TempRefPin<T> {
  * TempCow<T> [Cow<T>] *
  ***********************/
 
+/// A temporary representation of [`alloc::borrow::Cow`].
 #[cfg(feature = "alloc")]
 pub enum TempCow<T: ?Sized + alloc::borrow::ToOwned> {
     Borrowed(TempRef<T>),
@@ -942,6 +946,14 @@ macro_rules! impl_temp_repr_tuple {
 
             fn get_mut(&mut self) -> Self::Mutable<'_> {
                 ($(self.$idx.get_mut(),)*)
+            }
+
+            #[allow(unused_variables)]
+            fn get_mut_pinned(self: Pin<&mut Self>) -> Self::Mutable<'_> {
+                unsafe {
+                    let temp = self.get_unchecked_mut();
+                    ($(Pin::new_unchecked(&mut temp.$idx).get_mut_pinned(),)*)
+                }
             }
         }
 
@@ -1057,6 +1069,15 @@ unsafe impl<T: TempReprMut> TempReprMut for Range<T> {
     fn get_mut(&mut self) -> Self::Mutable<'_> {
         self.start.get_mut()..self.end.get_mut()
     }
+
+    fn get_mut_pinned(self: Pin<&mut Self>) -> Self::Mutable<'_> {
+        unsafe {
+            let temp = self.get_unchecked_mut();
+            let start = Pin::new_unchecked(&mut temp.start);
+            let end = Pin::new_unchecked(&mut temp.end);
+            start.get_mut_pinned()..end.get_mut_pinned()
+        }
+    }
 }
 
 unsafe impl<T: TempReprMutChk> TempReprMutChk for Range<T> {
@@ -1092,6 +1113,13 @@ unsafe impl<T: TempReprMut> TempReprMut for RangeFrom<T> {
 
     fn get_mut(&mut self) -> Self::Mutable<'_> {
         self.start.get_mut()..
+    }
+
+    fn get_mut_pinned(self: Pin<&mut Self>) -> Self::Mutable<'_> {
+        unsafe {
+            self.map_unchecked_mut(|temp| &mut temp.start)
+                .get_mut_pinned()..
+        }
     }
 }
 
@@ -1129,6 +1157,14 @@ unsafe impl<T: TempReprMut> TempReprMut for RangeTo<T> {
     fn get_mut(&mut self) -> Self::Mutable<'_> {
         ..self.end.get_mut()
     }
+
+    fn get_mut_pinned(self: Pin<&mut Self>) -> Self::Mutable<'_> {
+        unsafe {
+            ..self
+                .map_unchecked_mut(|temp| &mut temp.end)
+                .get_mut_pinned()
+        }
+    }
 }
 
 unsafe impl<T: TempReprMutChk> TempReprMutChk for RangeTo<T> {
@@ -1155,17 +1191,7 @@ unsafe impl TempRepr for RangeFull {
     }
 }
 
-unsafe impl TempReprMut for RangeFull {
-    type Mutable<'a> = RangeFull where Self: 'a;
-
-    unsafe fn new_temp_mut(_obj: RangeFull) -> Self {
-        ..
-    }
-
-    fn get_mut(&mut self) -> RangeFull {
-        ..
-    }
-}
+impl AlwaysShared for RangeFull {}
 
 unsafe impl TempReprMutChk for RangeFull {
     type SwapChkData = RangeFull;
@@ -1179,6 +1205,8 @@ unsafe impl TempReprMutChk for RangeFull {
  * Mapped types *
  ****************/
 
+/// Contains a trait [`HasTempRepr`] to implement [`TempRepr`] and [`TempReprMut`] by mapping to
+/// and from built-in types.
 pub mod mapped {
     use super::*;
 
@@ -1189,23 +1217,39 @@ pub mod mapped {
     /// same as `Self::Mutable<'static>`. Then [`MappedTempRepr<T>`] can be used as the argument of
     /// [`TempInst`].
     pub trait HasTempRepr {
-        type Temp: TempReprMutChk;
+        type Temp: TempRepr;
 
         type Shared<'a>
-        where
-            Self: 'a;
-
-        type Mutable<'a>
         where
             Self: 'a;
 
         fn shared_to_mapped(obj: Self::Shared<'_>) -> <Self::Temp as TempRepr>::Shared<'_>;
 
         fn mapped_to_shared(mapped: <Self::Temp as TempRepr>::Shared<'_>) -> Self::Shared<'_>;
+    }
+
+    pub trait HasTempReprMut: HasTempRepr<Temp: TempReprMut> {
+        type Mutable<'a>
+        where
+            Self: 'a;
 
         fn mut_to_mapped(obj: Self::Mutable<'_>) -> <Self::Temp as TempReprMut>::Mutable<'_>;
 
         fn mapped_to_mut(mapped: <Self::Temp as TempReprMut>::Mutable<'_>) -> Self::Mutable<'_>;
+    }
+
+    pub trait IsAlwaysShared: HasTempRepr<Temp: AlwaysShared> {}
+
+    impl<T: IsAlwaysShared> HasTempReprMut for T {
+        type Mutable<'a> = Self::Shared<'a> where Self: 'a;
+
+        fn mut_to_mapped(obj: Self::Mutable<'_>) -> <Self::Temp as TempReprMut>::Mutable<'_> {
+            Self::shared_to_mapped(obj)
+        }
+
+        fn mapped_to_mut(mapped: <Self::Temp as TempReprMut>::Mutable<'_>) -> Self::Mutable<'_> {
+            Self::mapped_to_shared(mapped)
+        }
     }
 
     /// See [`HasTempRepr`].
@@ -1223,7 +1267,7 @@ pub mod mapped {
         }
     }
 
-    unsafe impl<T: HasTempRepr> TempReprMut for MappedTempRepr<T> {
+    unsafe impl<T: HasTempReprMut> TempReprMut for MappedTempRepr<T> {
         type Mutable<'a> = T::Mutable<'a> where Self: 'a;
 
         unsafe fn new_temp_mut(obj: Self::Mutable<'_>) -> Self {
@@ -1235,11 +1279,13 @@ pub mod mapped {
         }
 
         fn get_mut_pinned(self: Pin<&mut Self>) -> Self::Mutable<'_> {
-            unsafe { T::mapped_to_mut(self.map_unchecked_mut(|temp| &mut temp.0).get_mut_pinned()) }
+            // SAFETY: Just a standard pin projection.
+            let temp = unsafe { self.map_unchecked_mut(|temp| &mut temp.0) };
+            T::mapped_to_mut(temp.get_mut_pinned())
         }
     }
 
-    unsafe impl<T: HasTempRepr> TempReprMutChk for MappedTempRepr<T> {
+    unsafe impl<T: HasTempReprMut<Temp: TempReprMutChk>> TempReprMutChk for MappedTempRepr<T> {
         type SwapChkData = <T::Temp as TempReprMutChk>::SwapChkData;
 
         fn swap_chk_data(&self) -> Self::SwapChkData {
@@ -1314,7 +1360,6 @@ pub mod mapped {
         type Temp = TempRef<[T]>;
 
         type Shared<'a> = slice::Iter<'a, T> where Self: 'a;
-        type Mutable<'a> = slice::Iter<'a, T> where Self: 'a;
 
         fn shared_to_mapped(obj: Self::Shared<'_>) -> <Self::Temp as TempRepr>::Shared<'_> {
             obj.as_slice()
@@ -1323,21 +1368,14 @@ pub mod mapped {
         fn mapped_to_shared(mapped: <Self::Temp as TempRepr>::Shared<'_>) -> Self::Shared<'_> {
             mapped.iter()
         }
-
-        fn mut_to_mapped(obj: Self::Mutable<'_>) -> <Self::Temp as TempReprMut>::Mutable<'_> {
-            obj.as_slice()
-        }
-
-        fn mapped_to_mut(mapped: <Self::Temp as TempReprMut>::Mutable<'_>) -> Self::Mutable<'_> {
-            mapped.iter()
-        }
     }
+
+    impl<T> IsAlwaysShared for slice::Iter<'static, T> {}
 
     impl<T> HasTempRepr for slice::IterMut<'static, T> {
         type Temp = TempRefMut<[T]>;
 
         type Shared<'a> = slice::Iter<'a, T> where Self: 'a;
-        type Mutable<'a> = slice::IterMut<'a, T> where Self: 'a;
 
         fn shared_to_mapped(obj: Self::Shared<'_>) -> <Self::Temp as TempRepr>::Shared<'_> {
             obj.as_slice()
@@ -1346,6 +1384,10 @@ pub mod mapped {
         fn mapped_to_shared(mapped: <Self::Temp as TempRepr>::Shared<'_>) -> Self::Shared<'_> {
             mapped.iter()
         }
+    }
+
+    impl<T> HasTempReprMut for slice::IterMut<'static, T> {
+        type Mutable<'a> = slice::IterMut<'a, T> where Self: 'a;
 
         fn mut_to_mapped(obj: Self::Mutable<'_>) -> <Self::Temp as TempReprMut>::Mutable<'_> {
             obj.into_slice()
@@ -1360,7 +1402,6 @@ pub mod mapped {
         type Temp = TempRef<str>;
 
         type Shared<'a> = Chars<'a> where Self: 'a;
-        type Mutable<'a> = Chars<'a> where Self: 'a;
 
         fn shared_to_mapped(obj: Self::Shared<'_>) -> <Self::Temp as TempRepr>::Shared<'_> {
             obj.as_str()
@@ -1369,15 +1410,9 @@ pub mod mapped {
         fn mapped_to_shared(mapped: <Self::Temp as TempRepr>::Shared<'_>) -> Self::Shared<'_> {
             mapped.chars()
         }
-
-        fn mut_to_mapped(obj: Self::Mutable<'_>) -> <Self::Temp as TempReprMut>::Mutable<'_> {
-            obj.as_str()
-        }
-
-        fn mapped_to_mut(mapped: <Self::Temp as TempReprMut>::Mutable<'_>) -> Self::Mutable<'_> {
-            mapped.chars()
-        }
     }
+
+    impl IsAlwaysShared for Chars<'static> {}
 }
 
 pub type TempSliceIter<T> = MappedTempRepr<slice::Iter<'static, T>>;
