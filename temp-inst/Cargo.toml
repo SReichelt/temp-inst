@@ -4,11 +4,25 @@ version = "1.0.0"
 authors = ["Sebastian Reichelt <SebastianR@gmx.de>"]
 license = "MIT OR Apache-2.0"
 edition = "2021"
+description = "Provides safe lifetime-erased representations for objects with lifetime parameters. Can be used to pass an object across an API where lifetime parameters would prevent it."
+repository = "https://github.com/SReichelt/temp-inst"
+readme = "README.md"
+keywords = ["lifetime", "lifetimes", "reference", "references"]
+categories = ["rust-patterns", "no-std::no-alloc"]
 
 [features]
 default = ["std"]
+
+# Rely on functionality from the standard library, in particular for the special panic behavior
+# requirements of this crate.
+# If not enabled, a certain panic situation will result in an endless loop instead of a regular
+# panic, unless overridden.
 std = ["alloc"]
+
+# Add a temporary representation for the Cow type. Enabled by default.
 alloc = []
+
+# Add a temporary representation for the Either type defined in the either crate.
 either = ["dep:either"]
 
 [dependencies]
