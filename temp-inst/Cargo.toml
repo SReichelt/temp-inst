@@ -11,7 +11,7 @@ keywords = ["lifetime", "lifetimes", "reference", "references"]
 categories = ["rust-patterns", "no-std::no-alloc"]
 
 [features]
-default = ["std"]
+default = ["std", "either"]
 
 # Rely on functionality from the standard library, in particular for the special panic behavior
 # requirements of this crate.

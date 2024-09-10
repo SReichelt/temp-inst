@@ -3,6 +3,8 @@
 
 use core::{iter::FusedIterator, mem::take};
 
+use either::Either;
+
 use super::*;
 
 /// A linked list data structure based on [`TempRepr`] and [`TempInst`]. The intended use case is
@@ -76,6 +78,7 @@ use super::*;
 ///         let Some(s) = s.strip_prefix('.') else {
 ///             return Err(format!("expected `.` at `{s}`"));
 ///         };
+///         // Create a new context with `name` added.
 ///         let body_ctx = ctx.new_frame(name);
 ///         let (body, s) = parse_expr(s, &body_ctx)?;
 ///         Ok((Some(Expr::Lambda(name.into(), Box::new(body))), s))
@@ -93,6 +96,7 @@ use super::*;
 ///             Ok((None, s))
 ///         } else {
 ///             let (name, r) = s.split_at(name_len);
+///             // Determine the De Bruijn index of the nearest `name` in context.
 ///             let Some(idx) = ctx.iter().position(|v| v == name) else {
 ///                 return Err(format!("variable `{name}` not found at `{s}`"));
 ///             };
@@ -159,13 +163,13 @@ pub enum TempStack<Root: TempRepr, Frame: TempRepr> {
 impl<Root: TempRepr, Frame: TempRepr> TempStack<Root, Frame> {
     /// Creates a new stack and returns a [`TempInst`] object that only hands out shared references.
     pub fn new_root(data: Root::Shared<'_>) -> TempStackFrame<'_, Root, Frame> {
-        TempInst::new(StackFrame::Root { data })
+        TempInst::new(Either::Left(data))
     }
 
     /// Creates a new stack that extends `self` with the given frame, and returns a [`TempInst`]
     /// object that only hands out shared references.
     pub fn new_frame<'a>(&'a self, data: Frame::Shared<'a>) -> TempStackFrame<'a, Root, Frame> {
-        TempInst::new(StackFrame::Frame { data, parent: self })
+        TempInst::new(Either::Right((data, self)))
     }
 
     /// Returns an iterator that traverses the stack starting at the current frame and ending at the
@@ -184,7 +188,7 @@ impl<Root: TempReprMut, Frame: TempReprMut> TempStack<Root, Frame> {
     ///
     /// Note that this requires the resulting object to be pinned, e.g. using [`core::pin::pin!`].
     pub fn new_root_mut(data: Root::Mutable<'_>) -> TempStackFrameMut<'_, Root, Frame> {
-        TempInstPin::new(StackFrameMut::Root { data })
+        TempInstPin::new(Either::Left(data))
     }
 
     /// Creates a new stack that extends `self` with the given frame, and returns a [`TempInstPin`]
@@ -195,7 +199,7 @@ impl<Root: TempReprMut, Frame: TempReprMut> TempStack<Root, Frame> {
         self: Pin<&'a mut Self>,
         data: Frame::Mutable<'a>,
     ) -> TempStackFrameMut<'a, Root, Frame> {
-        TempInstPin::new(StackFrameMut::Frame { data, parent: self })
+        TempInstPin::new(Either::Right((data, self)))
     }
 
     /// Returns an iterator that traverses the stack starting at the current frame and ending at the
@@ -211,41 +215,21 @@ impl<Root: TempReprMut, Frame: TempReprMut> TempStack<Root, Frame> {
 pub type TempStackRef<'a, Root, Frame> = &'a TempStack<Root, Frame>;
 pub type TempStackRefMut<'a, Root, Frame> = Pin<&'a mut TempStack<Root, Frame>>;
 
-/// The non-lifetime-erased representation of a stack frame within a shared [`TempStack`].
-pub enum StackFrame<'a, Root: TempRepr, Frame: TempRepr> {
-    Root {
-        data: Root::Shared<'a>,
-    },
-    Frame {
-        data: Frame::Shared<'a>,
-        parent: TempStackRef<'a, Root, Frame>,
-    },
-}
-
-/// The non-lifetime-erased representation of a stack frame within a mutable [`TempStack`].
-pub enum StackFrameMut<'a, Root: TempReprMut, Frame: TempReprMut> {
-    Root {
-        data: Root::Mutable<'a>,
-    },
-    Frame {
-        data: Frame::Mutable<'a>,
-        parent: TempStackRefMut<'a, Root, Frame>,
-    },
-}
-
 pub type TempStackFrame<'a, Root, Frame> = TempInst<'a, TempStack<Root, Frame>>;
 pub type TempStackFrameMut<'a, Root, Frame> = TempInstPin<'a, TempStack<Root, Frame>>;
 
 // SAFETY: This is just a standard implementation of `TempRepr` for an enum.
 unsafe impl<Root: TempRepr, Frame: TempRepr> TempRepr for TempStack<Root, Frame> {
-    type Shared<'a> = StackFrame<'a, Root, Frame> where Self: 'a;
+    type Shared<'a> = Either<Root::Shared<'a>, (Frame::Shared<'a>, TempStackRef<'a, Root, Frame>)>
+    where
+        Self: 'a;
 
     unsafe fn new_temp(obj: Self::Shared<'_>) -> Self {
         match obj {
-            StackFrame::Root { data } => TempStack::Root {
+            Either::Left(data) => TempStack::Root {
                 data: Root::new_temp(data),
             },
-            StackFrame::Frame { data, parent } => TempStack::Frame {
+            Either::Right((data, parent)) => TempStack::Frame {
                 data: Frame::new_temp(data),
                 parent: TempRefPin::new_temp(parent),
             },
@@ -254,25 +238,27 @@ unsafe impl<Root: TempRepr, Frame: TempRepr> TempRepr for TempStack<Root, Frame>
 
     fn get(&self) -> Self::Shared<'_> {
         match self {
-            TempStack::Root { data } => StackFrame::Root { data: data.get() },
-            TempStack::Frame { data, parent } => StackFrame::Frame {
-                data: data.get(),
-                parent: parent.get(),
-            },
+            TempStack::Root { data } => Either::Left(data.get()),
+            TempStack::Frame { data, parent } => Either::Right((data.get(), parent.get())),
         }
     }
 }
 
 // SAFETY: This is just a standard implementation of `TempReprMut` for an enum.
 unsafe impl<Root: TempReprMut, Frame: TempReprMut> TempReprMut for TempStack<Root, Frame> {
-    type Mutable<'a> = StackFrameMut<'a, Root, Frame> where Self: 'a;
+    type Mutable<'a> = Either<
+        Root::Mutable<'a>,
+        (Frame::Mutable<'a>, TempStackRefMut<'a, Root, Frame>),
+    >
+    where
+        Self: 'a;
 
     unsafe fn new_temp_mut(obj: Self::Mutable<'_>) -> Self {
         match obj {
-            StackFrameMut::Root { data } => TempStack::Root {
+            Either::Left(data) => TempStack::Root {
                 data: Root::new_temp_mut(data),
             },
-            StackFrameMut::Frame { data, parent } => TempStack::Frame {
+            Either::Right((data, parent)) => TempStack::Frame {
                 data: Frame::new_temp_mut(data),
                 parent: TempRefPin::new_temp_mut(parent),
             },
@@ -281,13 +267,8 @@ unsafe impl<Root: TempReprMut, Frame: TempReprMut> TempReprMut for TempStack<Roo
 
     fn get_mut(&mut self) -> Self::Mutable<'_> {
         match self {
-            TempStack::Root { data } => StackFrameMut::Root {
-                data: data.get_mut(),
-            },
-            TempStack::Frame { data, parent } => StackFrameMut::Frame {
-                data: data.get_mut(),
-                parent: parent.get_mut(),
-            },
+            TempStack::Root { data } => Either::Left(data.get_mut()),
+            TempStack::Frame { data, parent } => Either::Right((data.get_mut(), parent.get_mut())),
         }
     }
 
@@ -295,13 +276,11 @@ unsafe impl<Root: TempReprMut, Frame: TempReprMut> TempReprMut for TempStack<Roo
         // SAFETY: This only implements a pinning projection.
         unsafe {
             match self.get_unchecked_mut() {
-                TempStack::Root { data } => StackFrameMut::Root {
-                    data: Pin::new_unchecked(data).get_mut_pinned(),
-                },
-                TempStack::Frame { data, parent } => StackFrameMut::Frame {
-                    data: Pin::new_unchecked(data).get_mut_pinned(),
-                    parent: Pin::new_unchecked(parent).get_mut_pinned(),
-                },
+                TempStack::Root { data } => Either::Left(Pin::new_unchecked(data).get_mut_pinned()),
+                TempStack::Frame { data, parent } => Either::Right((
+                    Pin::new_unchecked(data).get_mut_pinned(),
+                    Pin::new_unchecked(parent).get_mut_pinned(),
+                )),
             }
         }
     }
@@ -394,7 +373,7 @@ impl<'a, Root: TempReprMut, Frame: TempReprMut> Iterator for TempStackIterMut<'a
 
     fn next(&mut self) -> Option<Self::Item> {
         let temp = take(&mut self.0).unwrap();
-        // SAFETY: This only implements a pinned projection.
+        // SAFETY: This only implements a pinning projection.
         unsafe {
             let temp = temp.get_unchecked_mut();
             match temp {

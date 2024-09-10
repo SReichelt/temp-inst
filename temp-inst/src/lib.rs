@@ -118,6 +118,7 @@ extern crate std;
 
 use mapped::*;
 
+#[cfg(feature = "either")]
 pub mod temp_stack;
 
 /// A wrapper around an instance of `T` which implements [`TempRepr`], i.e. is a temporary
