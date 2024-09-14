@@ -1,155 +1,160 @@
-//! Contains a [`TempStack`] type that can be used to build contexts living on the call stack in a
-//! convenient way.
+//! [`TempStack`] is a linked list data structure based on the [`temp_inst`] crate. The intended use
+//! case is that list items are allocated on the call stack; then the list also represents a "stack"
+//! with "frames". Via [`temp_inst`], each frame can contain references to data that is available at
+//! the point where it is constructed, without having to add lifetime parameters.
+//!
+//! # Example
+//!
+//! The following lambda expression parser uses [`TempStack`] as a context that specifies which
+//! variables are in scope, in order to determine the
+//! [de Bruijn index](https://en.wikipedia.org/wiki/De_Bruijn_index) corresponding to a given
+//! variable name.
+//!
+//! ```
+//! # use temp_inst::TempRef;
+//! # use crate::temp_stack::TempStack;
+//! #
+//! #[derive(Clone, PartialEq, Debug)]
+//! enum Expr {
+//!     Var(usize), // A de Bruijn index that specifies which binder the variable references.
+//!     App(Box<Expr>, Box<Expr>),
+//!     Lambda(String, Box<Expr>),
+//! }
+//!
+//! // The context containing the variables that are in scope at any given point during
+//! // parsing. Note how `Ctx` does not require any lifetime parameters, even though it
+//! // references strings with arbitrary lifetimes.
+//! type Ctx = TempStack<(), TempRef<str>>;
+//!
+//! fn parse(s: &str) -> Result<Expr, String> {
+//!     let root_ctx = Ctx::new_root(());
+//!     let (expr, s) = parse_expr(s, &root_ctx)?;
+//!     if !s.is_empty() {
+//!         return Err(format!("unexpected character at `{s}`"));
+//!     }
+//!     Ok(expr)
+//! }
+//!
+//! fn parse_expr<'a>(s: &'a str, ctx: &Ctx) -> Result<(Expr, &'a str), String> {
+//!     let (expr, mut s) = parse_single_expr(s, ctx)?;
+//!     let Some(mut expr) = expr else {
+//!         return Err(format!("expected expression at `{s}`"));
+//!     };
+//!     loop {
+//!         let (arg, r) = parse_single_expr(s, ctx)?;
+//!         s = r;
+//!         let Some(arg) = arg else {
+//!             break;
+//!         };
+//!         expr = Expr::App(Box::new(expr), Box::new(arg));
+//!     }
+//!     Ok((expr, s))
+//! }
+//!
+//! fn parse_single_expr<'a>(s: &'a str, ctx: &Ctx) -> Result<(Option<Expr>, &'a str), String> {
+//!     let s = s.trim_ascii_start();
+//!     if let Some(s) = s.strip_prefix('λ') {
+//!         let s = s.trim_ascii_start();
+//!         let name_len = s
+//!             .find(|ch: char| !ch.is_ascii_alphanumeric())
+//!             .unwrap_or(s.len());
+//!         if name_len == 0 {
+//!             return Err(format!("expected parameter name at `{s}`"));
+//!         }
+//!         let (name, s) = s.split_at(name_len);
+//!         let s = s.trim_ascii_start();
+//!         let Some(s) = s.strip_prefix('.') else {
+//!             return Err(format!("expected `.` at `{s}`"));
+//!         };
+//!         // Create a new context with `name` added.
+//!         let body_ctx = ctx.new_frame(name);
+//!         let (body, s) = parse_expr(s, &body_ctx)?;
+//!         Ok((Some(Expr::Lambda(name.into(), Box::new(body))), s))
+//!     } else if let Some(s) = s.strip_prefix('(') {
+//!         let (body, s) = parse_expr(s, ctx)?;
+//!         let Some(s) = s.strip_prefix(')') else {
+//!             return Err(format!("expected `)` at `{s}`"));
+//!         };
+//!         Ok((Some(body), s))
+//!     } else {
+//!         let name_len = s
+//!             .find(|ch: char| !ch.is_ascii_alphanumeric())
+//!             .unwrap_or(s.len());
+//!         if name_len == 0 {
+//!             Ok((None, s))
+//!         } else {
+//!             let (name, r) = s.split_at(name_len);
+//!             // Determine the De Bruijn index of the nearest `name` in context.
+//!             let Some(idx) = ctx.iter().position(|v| v == name) else {
+//!                 return Err(format!("variable `{name}` not found at `{s}`"));
+//!             };
+//!             Ok((Some(Expr::Var(idx)), r))
+//!         }
+//!     }
+//! }
+//!
+//! assert_eq!(
+//!     parse("λx.x"),
+//!     Ok(Expr::Lambda("x".into(), Box::new(Expr::Var(0))))
+//! );
+//!
+//! assert_eq!(
+//!     parse("λx. x x"),
+//!     Ok(Expr::Lambda(
+//!         "x".into(),
+//!         Box::new(Expr::App(Box::new(Expr::Var(0)), Box::new(Expr::Var(0))))
+//!     ))
+//! );
+//!
+//! assert_eq!(
+//!     parse("λx.λy. y (x y x)"),
+//!     Ok(Expr::Lambda(
+//!         "x".into(),
+//!         Box::new(Expr::Lambda(
+//!             "y".into(),
+//!             Box::new(Expr::App(
+//!                 Box::new(Expr::Var(0)),
+//!                 Box::new(Expr::App(
+//!                     Box::new(Expr::App(Box::new(Expr::Var(1)), Box::new(Expr::Var(0)))),
+//!                     Box::new(Expr::Var(1)),
+//!                 ))
+//!             ))
+//!         ))
+//!     ))
+//! );
+//!
+//! assert_eq!(
+//!     parse("λx.λy. (λz.z) (x z x)"),
+//!     Err("variable `z` not found at `z x)`".into())
+//! );
+//! ```
 
-use core::{iter::FusedIterator, mem::take};
+#![no_std]
+
+use core::{fmt::Debug, iter::FusedIterator, mem::take, pin::Pin};
 
 use either::Either;
+use temp_inst::{TempInst, TempInstPin, TempRefPin, TempRepr, TempReprMut};
 
-use super::*;
-
-/// A linked list data structure based on [`TempRepr`] and [`TempInst`]. The intended use case is
-/// that list items are allocated on the call stack; then the list is also a kind of "stack" with
-/// "frames". Each frame can contain references to data that is available at the point where it is
-/// constructed, without having to add lifetime parameters.
+/// A linked list consisting of a single item of type `Root` and arbitrarily many items of type
+/// `Frame`. Both types must implement [`temp_inst::TempRepr`], which declares them as "temporary
+/// representations" of possibly lifetime-dependent types such as references.
 ///
-/// Additionally, a stack may contain special data at its root, which can be useful for making
-/// stack-wide data available to all clients of the stack (but requires traversing the entire stack,
-/// of course).
-///
-/// Stacks can be constructed and referenced in a mutable or shared fashion, and in the mutable case
-/// the usual exclusivity rules apply. Note that adding a frame never alters the stack it was added
-/// to; it merely creates a new stack that borrows the original one (exclusively or shared).
-///
-/// # Example
-///
-/// The following lambda expression parser uses [`TempStack`] as a context that specifies which
-/// variables are in scope. Note how `Ctx` does not require any lifetime parameters, even though it
-/// borrows `str` references.
-///
-/// ```
-/// # use crate::temp_inst::{*, temp_stack::*};
-/// #
-/// #[derive(Clone, PartialEq, Debug)]
-/// enum Expr {
-///     Var(usize), // A De Bruijn index that specifies which binder the variable references.
-///     App(Box<Expr>, Box<Expr>),
-///     Lambda(String, Box<Expr>),
-/// }
-///
-/// type Ctx = TempStack<(), TempRef<str>>;
-///
-/// fn parse(s: &str) -> Result<Expr, String> {
-///     let root_ctx = Ctx::new_root(());
-///     let (expr, s) = parse_expr(s, &root_ctx)?;
-///     if !s.is_empty() {
-///         return Err(format!("unexpected character at `{s}`"));
-///     }
-///     Ok(expr)
-/// }
-///
-/// fn parse_expr<'a>(s: &'a str, ctx: &Ctx) -> Result<(Expr, &'a str), String> {
-///     let (expr, mut s) = parse_single_expr(s, ctx)?;
-///     let Some(mut expr) = expr else {
-///         return Err(format!("expected expression at `{s}`"));
-///     };
-///     loop {
-///         let (arg, r) = parse_single_expr(s, ctx)?;
-///         s = r;
-///         let Some(arg) = arg else {
-///             break;
-///         };
-///         expr = Expr::App(Box::new(expr), Box::new(arg));
-///     }
-///     Ok((expr, s))
-/// }
-///
-/// fn parse_single_expr<'a>(s: &'a str, ctx: &Ctx) -> Result<(Option<Expr>, &'a str), String> {
-///     let s = s.trim_ascii_start();
-///     if let Some(s) = s.strip_prefix('λ') {
-///         let s = s.trim_ascii_start();
-///         let name_len = s
-///             .find(|ch: char| !ch.is_ascii_alphanumeric())
-///             .unwrap_or(s.len());
-///         if name_len == 0 {
-///             return Err(format!("expected parameter name at `{s}`"));
-///         }
-///         let (name, s) = s.split_at(name_len);
-///         let s = s.trim_ascii_start();
-///         let Some(s) = s.strip_prefix('.') else {
-///             return Err(format!("expected `.` at `{s}`"));
-///         };
-///         // Create a new context with `name` added.
-///         let body_ctx = ctx.new_frame(name);
-///         let (body, s) = parse_expr(s, &body_ctx)?;
-///         Ok((Some(Expr::Lambda(name.into(), Box::new(body))), s))
-///     } else if let Some(s) = s.strip_prefix('(') {
-///         let (body, s) = parse_expr(s, ctx)?;
-///         let Some(s) = s.strip_prefix(')') else {
-///             return Err(format!("expected `)` at `{s}`"));
-///         };
-///         Ok((Some(body), s))
-///     } else {
-///         let name_len = s
-///             .find(|ch: char| !ch.is_ascii_alphanumeric())
-///             .unwrap_or(s.len());
-///         if name_len == 0 {
-///             Ok((None, s))
-///         } else {
-///             let (name, r) = s.split_at(name_len);
-///             // Determine the De Bruijn index of the nearest `name` in context.
-///             let Some(idx) = ctx.iter().position(|v| v == name) else {
-///                 return Err(format!("variable `{name}` not found at `{s}`"));
-///             };
-///             Ok((Some(Expr::Var(idx)), r))
-///         }
-///     }
-/// }
-///
-/// assert_eq!(
-///     parse("λx.x"),
-///     Ok(Expr::Lambda("x".into(), Box::new(Expr::Var(0))))
-/// );
-///
-/// assert_eq!(
-///     parse("λx. x x"),
-///     Ok(Expr::Lambda(
-///         "x".into(),
-///         Box::new(Expr::App(Box::new(Expr::Var(0)), Box::new(Expr::Var(0))))
-///     ))
-/// );
-///
-/// assert_eq!(
-///     parse("λx.λy. y (x y x)"),
-///     Ok(Expr::Lambda(
-///         "x".into(),
-///         Box::new(Expr::Lambda(
-///             "y".into(),
-///             Box::new(Expr::App(
-///                 Box::new(Expr::Var(0)),
-///                 Box::new(Expr::App(
-///                     Box::new(Expr::App(Box::new(Expr::Var(1)), Box::new(Expr::Var(0)))),
-///                     Box::new(Expr::Var(1)),
-///                 ))
-///             ))
-///         ))
-///     ))
-/// );
-///
-/// assert_eq!(
-///     parse("λx.λy. (λz.z) (x z x)"),
-///     Err("variable `z` not found at `z x)`".into())
-/// );
-/// ```
+/// A [`TempStack`] can be constructed and referenced in a mutable or shared fashion, and in the
+/// mutable case the usual exclusivity rules apply. However, adding an item never alters the list
+/// it was added to; it merely creates a new list that borrows the original one (exclusively or
+/// shared).
 ///
 /// # Remarks
 ///
-/// Although the root and frames can consist of arbitrary data via [`SelfRepr`], usually the size of
-/// both should be kept small, using references via [`TempRef`] or [`TempRefMut`] instead, for two
-/// reasons.
+/// Although the root and frames can consist of arbitrary data via [`temp_inst::SelfRepr`], usually
+/// the size of both should be kept small, using references via [`temp_inst::TempRef`] or
+/// [`temp_inst::TempRefMut`] instead, for two reasons.
 /// * Both root and frame data are stored in the same `enum`, so a large root also enlarges each
 ///   frame.
-/// * The stack iterators return copies/clones of the frame data. Therefore, if frames are large,
+/// * The iterators return copies/clones of the frame data. Therefore, if frames are large,
 ///   iteration should be implemented manually.
+#[derive(TempRepr, TempReprMut)]
 pub enum TempStack<Root: TempRepr, Frame: TempRepr> {
     Root {
         data: Root,
@@ -212,79 +217,38 @@ impl<Root: TempReprMut, Frame: TempReprMut> TempStack<Root, Frame> {
     }
 }
 
+impl<Root: TempRepr + Debug, Frame: TempRepr + Debug> Debug for TempStack<Root, Frame> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("[")?;
+        self.fmt_contents(f)?;
+        f.write_str("]")?;
+        Ok(())
+    }
+}
+
+impl<Root: TempRepr + Debug, Frame: TempRepr + Debug> TempStack<Root, Frame> {
+    fn fmt_contents(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            TempStack::Root { data } => data.fmt(f),
+            TempStack::Frame { data, parent } => {
+                parent.fmt_contents(f)?;
+                let separator = if matches!(**parent, TempStack::Root { .. }) {
+                    "; "
+                } else {
+                    ", "
+                };
+                f.write_str(separator)?;
+                data.fmt(f)
+            }
+        }
+    }
+}
+
 pub type TempStackRef<'a, Root, Frame> = &'a TempStack<Root, Frame>;
 pub type TempStackRefMut<'a, Root, Frame> = Pin<&'a mut TempStack<Root, Frame>>;
 
 pub type TempStackFrame<'a, Root, Frame> = TempInst<'a, TempStack<Root, Frame>>;
 pub type TempStackFrameMut<'a, Root, Frame> = TempInstPin<'a, TempStack<Root, Frame>>;
-
-// SAFETY: This is just a standard implementation of `TempRepr` for an enum.
-unsafe impl<Root: TempRepr, Frame: TempRepr> TempRepr for TempStack<Root, Frame> {
-    type Shared<'a> = Either<Root::Shared<'a>, (Frame::Shared<'a>, TempStackRef<'a, Root, Frame>)>
-    where
-        Self: 'a;
-
-    unsafe fn new_temp(obj: Self::Shared<'_>) -> Self {
-        match obj {
-            Either::Left(data) => TempStack::Root {
-                data: Root::new_temp(data),
-            },
-            Either::Right((data, parent)) => TempStack::Frame {
-                data: Frame::new_temp(data),
-                parent: TempRefPin::new_temp(parent),
-            },
-        }
-    }
-
-    fn get(&self) -> Self::Shared<'_> {
-        match self {
-            TempStack::Root { data } => Either::Left(data.get()),
-            TempStack::Frame { data, parent } => Either::Right((data.get(), parent.get())),
-        }
-    }
-}
-
-// SAFETY: This is just a standard implementation of `TempReprMut` for an enum.
-unsafe impl<Root: TempReprMut, Frame: TempReprMut> TempReprMut for TempStack<Root, Frame> {
-    type Mutable<'a> = Either<
-        Root::Mutable<'a>,
-        (Frame::Mutable<'a>, TempStackRefMut<'a, Root, Frame>),
-    >
-    where
-        Self: 'a;
-
-    unsafe fn new_temp_mut(obj: Self::Mutable<'_>) -> Self {
-        match obj {
-            Either::Left(data) => TempStack::Root {
-                data: Root::new_temp_mut(data),
-            },
-            Either::Right((data, parent)) => TempStack::Frame {
-                data: Frame::new_temp_mut(data),
-                parent: TempRefPin::new_temp_mut(parent),
-            },
-        }
-    }
-
-    fn get_mut(&mut self) -> Self::Mutable<'_> {
-        match self {
-            TempStack::Root { data } => Either::Left(data.get_mut()),
-            TempStack::Frame { data, parent } => Either::Right((data.get_mut(), parent.get_mut())),
-        }
-    }
-
-    fn get_mut_pinned(self: Pin<&mut Self>) -> Self::Mutable<'_> {
-        // SAFETY: This only implements a pinning projection.
-        unsafe {
-            match self.get_unchecked_mut() {
-                TempStack::Root { data } => Either::Left(Pin::new_unchecked(data).get_mut_pinned()),
-                TempStack::Frame { data, parent } => Either::Right((
-                    Pin::new_unchecked(data).get_mut_pinned(),
-                    Pin::new_unchecked(parent).get_mut_pinned(),
-                )),
-            }
-        }
-    }
-}
 
 /// An iterator over frames of a shared `TempStack`.
 pub struct TempStackIter<'a, Root: TempRepr, Frame: TempRepr>(TempStackRef<'a, Root, Frame>);
@@ -397,6 +361,10 @@ impl<'a, Root: TempReprMut, Frame: TempReprMut> FusedIterator
 
 #[cfg(test)]
 mod tests {
+    use core::pin::pin;
+
+    use temp_inst::{TempRef, TempRefMut};
+
     use super::*;
 
     #[test]

@@ -60,7 +60,7 @@ See the [source code](temp-inst/src/lib.rs) for more info.
 
 [dyn-context](https://crates.io/crates/dyn-context) is another solution for the same problem. The
 main difference is that it focuses on user-defined types, whereas temp-inst defines a trait that is
-already implemented for standard types but must currently be implemented manually for custom types.
+already implemented for standard types but must be derived or implemented manually for custom types.
 
 ## License
 
@@ -68,7 +68,7 @@ Licensed under either of
 
  * Apache License, Version 2.0
    ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
- * MIT license
+ * MIT License
    ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
 at your option.

@@ -25,5 +25,9 @@ alloc = []
 # Add a temporary representation for the Either type defined in the either crate.
 either = ["dep:either"]
 
+# Support `#[derive(TempRepr, TempReprMut, TempReprMutChk)]`.
+derive = ["dep:temp-inst-derive"]
+
 [dependencies]
+temp-inst-derive = { path = "../temp-inst-derive", optional = true }
 either = { version = "1.13.0", default-features = false, optional = true }

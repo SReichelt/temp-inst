@@ -1,0 +1,18 @@
+[package]
+name = "temp-stack"
+version = "1.0.0"
+authors = ["Sebastian Reichelt <SebastianR@gmx.de>"]
+license = "MIT OR Apache-2.0"
+edition = "2021"
+description = "A data structure for contexts or similar stack structures that are allocated on the call stack, using the temp-inst crate for lifetime erasure."
+repository = "https://github.com/SReichelt/temp-inst"
+readme = "README.md"
+keywords = ["lifetime", "lifetimes", "reference", "references"]
+categories = ["rust-patterns", "no-std::no-alloc"]
+
+[dependencies]
+temp-inst = { path = "../temp-inst", default-features = false, features = [
+    "either",
+    "derive",
+] }
+either = { version = "1.13.0", default-features = false }

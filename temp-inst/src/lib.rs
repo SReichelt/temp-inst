@@ -94,13 +94,13 @@
 //! assert_eq!(sum_of_products, 42 * 23 + 42 * 23);
 //! ```
 //!
-//! For another use case, see [`temp_stack::TempStack`].
+//! For another use case, see the `temp_stack` crate.
 
 #![no_std]
 
 use core::{
     cmp::Ordering,
-    fmt::{self, Debug},
+    fmt::{self, Debug, Display},
     hash::{Hash, Hasher},
     marker::PhantomData,
     ops::{Deref, DerefMut, Range, RangeFrom, RangeFull, RangeTo},
@@ -116,10 +116,10 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-use mapped::*;
+#[cfg(feature = "derive")]
+pub use temp_inst_derive::{TempRepr, TempReprMut, TempReprMutChk};
 
-#[cfg(feature = "either")]
-pub mod temp_stack;
+use mapped::*;
 
 /// A wrapper around an instance of `T` which implements [`TempRepr`], i.e. is a temporary
 /// representation of a type `T::Shared<'a>`.
@@ -171,6 +171,12 @@ impl<'a, T: TempRepr<Shared<'a>: Default>> Default for TempInst<'a, T> {
 }
 
 impl<T: TempRepr + Debug> Debug for TempInst<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<T: TempRepr + Display> Display for TempInst<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
@@ -245,6 +251,12 @@ impl<'a, T: TempReprMut<Mutable<'a>: Default>> Default for TempInstPin<'a, T> {
 }
 
 impl<T: TempReprMut + Debug> Debug for TempInstPin<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<T: TempReprMut + Display> Display for TempInstPin<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
@@ -362,6 +374,13 @@ impl<T: TempReprMutChk + Debug> Debug for TempInstMut<'_, T> {
         self.0.fmt(f)
     }
 }
+
+impl<T: TempReprMutChk + Display> Display for TempInstMut<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 impl<T: TempReprMutChk> Drop for TempInstMut<'_, T> {
     fn drop(&mut self) {
         if self.0.swap_chk_data() != self.1 {
@@ -673,6 +692,12 @@ impl<T: ?Sized + Debug> Debug for TempRef<T> {
     }
 }
 
+impl<T: ?Sized + Display> Display for TempRef<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
 // SAFETY: `TempRef<T>` follows the same rules as `&T` regarding thread safety.
 unsafe impl<T: ?Sized + Sync> Send for TempRef<T> {}
 unsafe impl<T: ?Sized + Sync> Sync for TempRef<T> {}
@@ -754,6 +779,12 @@ impl<T: ?Sized + Debug> Debug for TempRefMut<T> {
     }
 }
 
+impl<T: ?Sized + Display> Display for TempRefMut<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
 // SAFETY: `TempRefMut<T>` follows the same rules as `&mut T` regarding thread safety.
 unsafe impl<T: ?Sized + Send> Send for TempRefMut<T> {}
 unsafe impl<T: ?Sized + Sync> Sync for TempRefMut<T> {}
@@ -824,6 +855,12 @@ impl<T: ?Sized> Deref for TempRefPin<T> {
 }
 
 impl<T: ?Sized + Debug> Debug for TempRefPin<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
+impl<T: ?Sized + Display> Display for TempRefPin<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.get().fmt(f)
     }
@@ -1351,6 +1388,15 @@ pub mod mapped {
     impl<T: HasTempRepr> Debug for MappedTempRepr<T>
     where
         for<'a> T::Shared<'a>: Debug,
+    {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.get().fmt(f)
+        }
+    }
+
+    impl<T: HasTempRepr> Display for MappedTempRepr<T>
+    where
+        for<'a> T::Shared<'a>: Display,
     {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             self.get().fmt(f)

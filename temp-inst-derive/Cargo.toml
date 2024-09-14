@@ -1,0 +1,23 @@
+[package]
+name = "temp-inst-derive"
+version = "1.0.0"
+authors = ["Sebastian Reichelt <SebastianR@gmx.de>"]
+license = "MIT OR Apache-2.0"
+edition = "2021"
+description = "Derive macros for the temp-inst crate."
+repository = "https://github.com/SReichelt/temp-inst"
+readme = "README.md"
+keywords = ["lifetime", "lifetimes", "reference", "references"]
+categories = ["rust-patterns", "no-std::no-alloc"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0.86"
+quote = "1.0.37"
+syn = "2.0.77"
+
+[dev-dependencies]
+temp-inst = { path = "../temp-inst" }
+either = { version = "1.13.0", default-features = false }
