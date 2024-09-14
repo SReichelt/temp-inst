@@ -19,5 +19,5 @@ quote = "1.0.37"
 syn = "2.0.77"
 
 [dev-dependencies]
-temp-inst = { path = "../temp-inst" }
+temp-inst = { version = "1.0.0", path = "../temp-inst" }
 either = { version = "1.13.0", default-features = false }

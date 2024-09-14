@@ -11,7 +11,7 @@ keywords = ["lifetime", "lifetimes", "reference", "references"]
 categories = ["rust-patterns", "no-std::no-alloc"]
 
 [dependencies]
-temp-inst = { path = "../temp-inst", default-features = false, features = [
+temp-inst = { version = "1.0.0", path = "../temp-inst", default-features = false, features = [
     "either",
     "derive",
 ] }
