@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 edition = "2021"
 description = "Derive macros for the temp-inst crate."
 repository = "https://github.com/SReichelt/temp-inst"
-readme = "README.md"
+readme = "../README.md"
 keywords = ["lifetime", "lifetimes", "reference", "references"]
 categories = ["rust-patterns", "no-std::no-alloc"]
 
