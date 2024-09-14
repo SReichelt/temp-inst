@@ -54,7 +54,7 @@ assert_eq!(a, 42 + 23 + 1 + 23);
 assert_eq!(b, 23 + 1 + 1);
 ```
 
-See the [source code](temp-inst/src/lib.rs) for more info.
+See the [documentation](https://docs.rs/temp-inst/latest/temp_inst/) for more info.
 
 ## Similar crates
 
