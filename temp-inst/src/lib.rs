@@ -288,7 +288,7 @@ impl<'a, T: TempReprMutChk> TempInstMut<'a, T> {
     ///
     /// # Safety
     ///
-    /// The caller must ensure at least one of the following two conditions.
+    /// The caller must ensure at least one of the following three conditions.
     /// * The [`Drop`] implementation of [`TempInstMut`] is called whenever the returned instance
     ///   goes out of scope.
     ///   (In particular, the instance must not be passed to [`core::mem::forget`].)

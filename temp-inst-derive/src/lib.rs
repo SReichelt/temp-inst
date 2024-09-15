@@ -47,7 +47,7 @@ pub fn derive_temp_repr(input: proc_macro::TokenStream) -> proc_macro::TokenStre
                 #[automatically_derived]
                 #[allow(clippy::unused_unit)]
                 unsafe impl #impl_generics temp_inst::TempRepr for #ident #ty_generics #where_clause {
-                    type Shared<'a> = #shared where Self: 'a;
+                    type Shared<'__a> = #shared where Self: '__a;
 
                     #[allow(unused_variables)]
                     unsafe fn new_temp(obj: Self::Shared<'_>) -> Self {
@@ -106,7 +106,7 @@ pub fn derive_temp_repr_mut(input: proc_macro::TokenStream) -> proc_macro::Token
                 #[automatically_derived]
                 #[allow(clippy::unused_unit)]
                 unsafe impl #impl_generics temp_inst::TempReprMut for #ident #ty_generics #where_clause {
-                    type Mutable<'a> = #mutable where Self: 'a;
+                    type Mutable<'__a> = #mutable where Self: '__a;
 
                     #[allow(unused_variables)]
                     unsafe fn new_temp_mut(obj: Self::Mutable<'_>) -> Self {
@@ -394,8 +394,8 @@ impl TempReprImpl {
         ty: &Type,
     ) -> Self {
         TempReprImpl {
-            shared: quote!(<#ty as temp_inst::TempRepr>::Shared<'a>),
-            mutable: quote!(<#ty as temp_inst::TempReprMut>::Mutable<'a>),
+            shared: quote!(<#ty as temp_inst::TempRepr>::Shared<'__a>),
+            mutable: quote!(<#ty as temp_inst::TempReprMut>::Mutable<'__a>),
             new_temp: quote!(<#ty as temp_inst::TempRepr>::new_temp(#obj)),
             new_temp_mut: quote!(<#ty as temp_inst::TempReprMut>::new_temp_mut(#obj)),
             get: quote!(<#ty as temp_inst::TempRepr>::get(#member)),

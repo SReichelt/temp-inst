@@ -29,5 +29,5 @@ either = ["dep:either"]
 derive = ["dep:temp-inst-derive"]
 
 [dependencies]
-temp-inst-derive = { version = "1.0.0", path = "../temp-inst-derive", optional = true }
+temp-inst-derive = { version = "1.0.1", path = "../temp-inst-derive", optional = true }
 either = { version = "1.13.0", default-features = false, optional = true }
